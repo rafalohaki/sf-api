@@ -47,11 +47,37 @@ pub struct Session {
     /// recovered from metadata (only `RequestHelper.SetJWTHeader` and
     /// `ARequest.get_HasJTWHeader` are known), so the caller supplies both the
     /// name and the value.
-    jwt_header: Option<(HeaderName, HeaderValue)>,
+    ///
+    /// Stored through [`SecretHeaderValue`] because a JWT is a usable login
+    /// credential: `Session` derives `Debug` and must not print it.
+    jwt_header: Option<(HeaderName, SecretHeaderValue)>,
     /// Optional SSO domain header attached to every request when configured
     /// (client `RequestHelper.SetSSODomainHeader`). The concrete header name
     /// was not recovered from metadata and is supplied by the caller.
-    sso_domain_header: Option<(HeaderName, HeaderValue)>,
+    ///
+    /// Stored through [`SecretHeaderValue`] for the same reason as
+    /// [`Self::jwt_header`].
+    sso_domain_header: Option<(HeaderName, SecretHeaderValue)>,
+}
+
+/// An HTTP header value that never prints its contents.
+///
+/// Carries the same bytes as a [`HeaderValue`] but implements `Debug` as
+/// `[redacted]`, so `#[derive(Debug)]` sessions cannot leak credentials
+/// (JWTs, tokens) into logs or panic messages.
+#[derive(Clone)]
+struct SecretHeaderValue(HeaderValue);
+
+impl std::fmt::Debug for SecretHeaderValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl SecretHeaderValue {
+    fn from_raw(value: HeaderValue) -> Self {
+        Self(value)
+    }
 }
 
 /// The password of a character, hashed in the way, that the server expects
@@ -148,7 +174,7 @@ impl Session {
             .map_err(|_| SFError::InvalidRequest("Invalid JWT header name"))?;
         let value = HeaderValue::from_str(value)
             .map_err(|_| SFError::InvalidRequest("Invalid JWT header value"))?;
-        self.jwt_header = Some((name, value));
+        self.jwt_header = Some((name, SecretHeaderValue::from_raw(value)));
         Ok(())
     }
 
@@ -177,7 +203,7 @@ impl Session {
         let value = HeaderValue::from_str(value).map_err(|_| {
             SFError::InvalidRequest("Invalid SSO domain header value")
         })?;
-        self.sso_domain_header = Some((name, value));
+        self.sso_domain_header = Some((name, SecretHeaderValue::from_raw(value)));
         Ok(())
     }
 
@@ -389,14 +415,14 @@ impl Session {
 
         // Client 32.0 `RequestHelper.SetSSODomainHeader`
         if let Some((name, value)) = &self.sso_domain_header {
-            req = req.header(name, value);
+            req = req.header(name, value.0.clone());
         }
         // Client 32.0 `ARequest.get_HasJTWHeader` +
         // `RequestHelper.SetJWTHeader`
         if metadata.has_jwt_header
             && let Some((name, value)) = &self.jwt_header
         {
-            req = req.header(name, value);
+            req = req.header(name, value.0.clone());
         }
 
         let resp = req.send().await.map_err(|_| SFError::ConnectionError)?;

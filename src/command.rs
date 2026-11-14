@@ -1532,6 +1532,23 @@ impl Command {
             gamestate::dungeons::{LightDungeon, ShadowDungeon},
             misc::{HASH_CONST, sha1_hash, to_sf_string},
         };
+        // Payment safety gate (real-money path): the 32.0 shop requests carry
+        // free-form fields (store `signature`, product `description`) inside a
+        // `/`-separated parameter list. Neither an escape mechanism nor the
+        // exact wire layout was recoverable from static metadata, and a
+        // standard-base64 signature contains `/`, which would shift every
+        // parameter after it on the server. Until the format is verified
+        // against a live server (or IL), refuse to send instead of gambling
+        // with a payment request. See `gamestate/shop.rs` and
+        // `docs/re/sf-client-protocol.md` §4.
+        if matches!(
+            self,
+            Command::ShopCheckout { .. } | Command::ShopInit { .. }
+        ) {
+            return Err(SFError::InvalidRequest(
+                "shop payment request wire format is unverified; refusing to send until confirmed against a live server",
+            ));
+        }
 
         Ok(match self {
             Command::Custom {
@@ -2749,6 +2766,10 @@ mod tests {
         };
         assert_eq!(cmd.request_string().unwrap(), "GetShopCatalog:3/1");
 
+        // Payment-safety gate: ShopInit/ShopCheckout refuse to build a wire
+        // string until the `/`-separated format is verified against a live
+        // server (a standard-base64 signature contains `/`). See
+        // `review_fix_tests` and `gamestate/shop.rs`.
         let cmd = Command::ShopInit {
             request: ShopInitRequest {
                 platform: AppStore::Android,
@@ -2758,9 +2779,9 @@ mod tests {
                 user_id: "user".to_string(),
             },
         };
-        assert_eq!(
-            cmd.request_string().unwrap(),
-            "ShopInit:1/product/EUR/desc/user"
+        assert!(
+            cmd.request_string().is_err(),
+            "unverified payment wire must refuse"
         );
 
         let cmd = Command::ShopPreCheckout {
@@ -2846,5 +2867,76 @@ mod tests {
         };
         assert_eq!(cmd.request_metadata(), metadata);
         assert_eq!(cmd.request_string().unwrap(), "Poll:");
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    //! Review fixes: payment-safety gate + secret redaction.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::Command;
+    use crate::error::SFError;
+    use crate::gamestate::shop::{AppStore, ShopCheckoutRequest, ShopInitRequest};
+
+    /// The payment requests must refuse to go on the wire until the exact
+    /// `/`-separated format is verified against a live server: a standard
+    /// base64 signature contains `/` and would shift every later parameter.
+    #[test]
+    fn shop_payment_requests_refuse_unverified_wire() {
+        let init = Command::ShopInit {
+            request: ShopInitRequest {
+                platform: AppStore::Steam,
+                product_id: "p".into(),
+                currency: "USD".into(),
+                description: "desc".into(),
+                user_id: "u".into(),
+            },
+        };
+        let checkout = Command::ShopCheckout {
+            request: ShopCheckoutRequest {
+                platform: AppStore::Steam,
+                product_id: "p".into(),
+                locale: "en".into(),
+                description: "desc".into(),
+                free_or_payed_with_in_game_currency: false,
+                signature: "abc+/==".into(),
+                transaction_uuid: "0000".into(),
+                currency: "USD".into(),
+                ios_storefront_location: String::new(),
+            },
+        };
+        for cmd in [init, checkout] {
+            let err = cmd
+                .request_string()
+                .expect_err("unverified payment wire must refuse");
+            assert!(
+                matches!(err, SFError::InvalidRequest(msg) if msg.contains("unverified")),
+                "wrong refusal: {err:?}"
+            );
+        }
+    }
+
+    /// A payment signature is a usable credential: `{:?}` of the command must
+    /// not contain it (it is printed by `trace!("Sending a {command:?}")`).
+    #[test]
+    fn shop_checkout_debug_redacts_signature() {
+        let cmd = Command::ShopCheckout {
+            request: ShopCheckoutRequest {
+                platform: AppStore::Steam,
+                product_id: "p".into(),
+                locale: "en".into(),
+                description: "desc".into(),
+                free_or_payed_with_in_game_currency: false,
+                signature: "SUPER-SECRET-SIGNATURE".into(),
+                transaction_uuid: "TX-000".into(),
+                currency: "USD".into(),
+                ios_storefront_location: String::new(),
+            },
+        };
+        let printed = format!("{cmd:?}");
+        assert!(!printed.contains("SUPER-SECRET-SIGNATURE"));
+        assert!(!printed.contains("TX-000"));
+        assert!(printed.contains("[redacted]"));
     }
 }

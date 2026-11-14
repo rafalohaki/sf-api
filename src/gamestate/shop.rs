@@ -63,7 +63,7 @@ pub struct ShopInitRequest {
 }
 
 /// Fields of the client's `ShopCheckoutRequest` (type 5767).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShopCheckoutRequest {
     /// The store platform the client reports
@@ -77,6 +77,10 @@ pub struct ShopCheckoutRequest {
     /// Whether the purchase was free or paid with in-game currency
     pub free_or_payed_with_in_game_currency: bool,
     /// The store signature of the purchase
+    ///
+    /// **Secret**: a payment credential. Deliberately omitted from
+    /// [`std::fmt::Debug`] so `trace!("Sending a {command:?}")` and any
+    /// `{:?}` of a session/command cannot leak it into logs.
     pub signature: String,
     /// The store transaction uuid
     pub transaction_uuid: String,
@@ -84,4 +88,25 @@ pub struct ShopCheckoutRequest {
     pub currency: String,
     /// The iOS storefront location (only used by the iOS store)
     pub ios_storefront_location: String,
+}
+
+impl std::fmt::Debug for ShopCheckoutRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Payment-credential redaction: the signature is a usable secret; the
+        // transaction uuid identifies the purchase and is redacted with it.
+        f.debug_struct("ShopCheckoutRequest")
+            .field("platform", &self.platform)
+            .field("product_id", &self.product_id)
+            .field("locale", &self.locale)
+            .field("description", &self.description)
+            .field(
+                "free_or_payed_with_in_game_currency",
+                &self.free_or_payed_with_in_game_currency,
+            )
+            .field("signature", &"[redacted]")
+            .field("transaction_uuid", &"[redacted]")
+            .field("currency", &self.currency)
+            .field("ios_storefront_location", &self.ios_storefront_location)
+            .finish()
+    }
 }
