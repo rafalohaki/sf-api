@@ -36,7 +36,7 @@ pub enum WheelRewardType {
 }
 
 /// The thing you won from spinning the wheel
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WheelReward {
     /// The type of item you have won
@@ -338,6 +338,95 @@ impl Task {
     }
 }
 
+/// Which wheel the player wants to spin (client 32.0 enum `WheelType`,
+/// `PlayaGames.ShakesAndFidget.WheelModel`).
+///
+/// The numeric values follow the declaration order observed in the client
+/// metadata; they were not verified against the compiled enum constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, FromPrimitive)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(missing_docs)]
+pub enum WheelType {
+    /// The regular wheel
+    #[default]
+    Basic = 0,
+    /// The upgraded regular wheel
+    BasicPlus,
+    /// The advanced wheel
+    Advanced,
+    /// The winter event wheel
+    Winter,
+    /// The special winter event wheel
+    WinterSpecial,
+}
+
+/// State of one active wheel (client 32.0 `WheelActiveInfo`, type 12491).
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WheelActiveInfo {
+    /// The wheel this entry describes
+    pub wheel_type: WheelType,
+    /// The number of turns already used today
+    pub turns_today: u32,
+    /// The total number of turns available
+    pub turns_total: u32,
+    /// The next time a free turn becomes available
+    pub next_free_turn: Option<DateTime<Local>>,
+}
+
+/// One configuration entry of `WheelsConfig.ConfigInfos`.
+///
+/// The client metadata exposes the field names `WheelsCount` and
+/// `ConfigInfos`, but not the field layout of an individual entry. The raw
+/// values are preserved so callers can interpret them once the schema has
+/// been verified.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WheelConfigInfo {
+    /// Raw values of this configuration entry, in server order
+    pub raw: Vec<i64>,
+}
+
+/// Wheel configuration (client 32.0 `WheelsConfig`, type 12496).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WheelsConfig {
+    /// The number of wheels the player has (`WheelsCount`)
+    pub wheels_count: u32,
+    /// The per-wheel configuration entries (`ConfigInfos`)
+    pub config_infos: Vec<WheelConfigInfo>,
+}
+
+/// One resource entry of the wheel model (client 32.0 `WheelResourceEntry`,
+/// type 1705).
+///
+/// The client metadata does not expose the entry layout, so the raw values are
+/// preserved verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WheelResourceEntry {
+    /// Raw values of this resource entry, in server order
+    pub raw: Vec<i64>,
+}
+
+/// Resources of the wheel model (client 32.0 `WheelResources`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WheelResources {
+    /// The resource entries of the wheel
+    pub entries: Vec<WheelResourceEntry>,
+}
+
+/// Result of a wheel spin (client 32.0 `WheelResult`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WheelResult {
+    /// The wheel that produced the result
+    pub wheel_type: WheelType,
+    /// The reward that was won
+    pub reward: WheelReward,
+}
+
 /// Dr. Abawuwu's wheel
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -350,6 +439,34 @@ pub struct Wheel {
     pub next_free_spin: Option<DateTime<Local>>,
     /// The result of spinning the wheel
     pub result: Option<WheelReward>,
+    /// Active wheels, one entry per wheel type (client 32.0
+    /// `Wheel.WheelsActive`).
+    ///
+    /// Not populated by the current response parser: the lowercase wire keys
+    /// for the 32.0 wheel were not confirmed statically (see
+    /// `docs/re/sf-client-protocol.md` §6, limitation 3).
+    pub wheels_active: Vec<WheelActiveInfo>,
+    /// Wheel configuration (client 32.0 `Wheel.WheelsConfig`). Not populated
+    /// by the current parser for the same reason as [`Self::wheels_active`].
+    pub wheels_config: Option<WheelsConfig>,
+    /// Wheel resources (client 32.0 `Wheel.WheelResources`). Not populated by
+    /// the current parser for the same reason as [`Self::wheels_active`].
+    pub wheel_resources: Option<WheelResources>,
+    /// Result of the last spin including the wheel type (client 32.0
+    /// `Wheel.WheelResult`). Not populated by the current parser; the legacy
+    /// [`Self::result`] keeps being filled from the `wheelresult` key.
+    pub wheel_result: Option<WheelResult>,
+    /// Whether the player has a second wheel (`Wheel.HasWheel2`)
+    pub has_wheel2: bool,
+    /// Whether the second wheel is unlocked (`Wheel.UnlockedWheel2`)
+    pub unlocked_wheel2: bool,
+    /// Active event type of the event wheel
+    /// (`Wheel.GetActiveWheelEventType`)
+    pub active_wheel_event_type: Option<u32>,
+    /// Whether the event wheel has ended (`Wheel.IsEventEnded`)
+    pub is_event_ended: bool,
+    /// Name of the active event wheel (`Wheel.GetActiveWheelEventName`)
+    pub active_wheel_event_name: Option<String>,
 }
 
 /// The theme the event tasks have

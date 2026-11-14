@@ -19,11 +19,58 @@ use crate::{
             DoorType, DungeonEffectType, GemOfFateType,
             LegendaryDungeonEventTheme, RPSChoice,
         },
+        rewards::WheelType,
+        shop::{AppStore, ShopCheckoutRequest, ShopInitRequest},
         social::Relationship,
         underworld::*,
         unlockables::*,
     },
 };
+
+/// Per-request metadata, that the official client keeps on its `ARequest`
+/// base class (`MinParameters`, `NeedsSessionID`, `Parameterless`,
+/// `ResponseDelay`) plus the `HasJTWHeader` flag used to decide whether the
+/// JWT header is attached.
+///
+/// The client exposes these as per-request getters. Which concrete values each
+/// request uses could not be recovered from the metadata dump (no method
+/// bodies), so [`Command::request_metadata`] returns conservative defaults
+/// that preserve this crate's previous behavior. Use
+/// [`Command::WithMetadata`] to attach explicit metadata to a single request
+/// once the values are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RequestMetadata {
+    /// Whether the `sid` query parameter must be appended to the request URL
+    /// (`ARequest.get_NeedsSessionID`)
+    pub needs_session_id: bool,
+    /// The minimum number of `/`-separated parameters the request expects
+    /// (`ARequest.get_MinParameters`)
+    pub min_parameters: Option<usize>,
+    /// Whether the request must not carry any parameters
+    /// (`ARequest.get_Parameterless` / `get_CanUseParameterless`)
+    pub parameterless: bool,
+    /// Delay the client applies before sending this request
+    /// (`ARequest.get_ResponseDelay`)
+    pub response_delay: Option<std::time::Duration>,
+    /// Whether the client attaches its JWT header to this request
+    /// (`ARequest.get_HasJTWHeader`)
+    pub has_jwt_header: bool,
+}
+
+impl Default for RequestMetadata {
+    fn default() -> Self {
+        // `needs_session_id: true` keeps the behavior of the previous
+        // `send_command_raw`, which always appended `sid`.
+        Self {
+            needs_session_id: true,
+            min_parameters: None,
+            parameterless: false,
+            response_delay: None,
+            has_jwt_header: false,
+        }
+    }
+}
 
 /// A command, that can be sent to the sf server
 #[non_exhaustive]
@@ -222,6 +269,10 @@ pub enum Command {
         name: String,
     },
     /// Loads a mushroom into the catapult
+    ///
+    /// **Legacy:** the 32.0 client does not send `GroupIncreaseBuilding` (not
+    /// in `RequestNames`). The wire string is kept unchanged because it may
+    /// still be a server-side alias.
     GuildLoadMushrooms,
     /// Increases one of the guild skills by 1. Needs to know the current, not
     /// the new value for some reason
@@ -256,6 +307,10 @@ pub enum Command {
         /// See [`PlayerItemPosition`] for how to obtain it
         item_pos: PlayerItemPosition,
     },
+    /// Washes the character after using the toilet (client 32.0
+    /// `PlayerToilettWashRequest`; the client really spells it with the
+    /// `Request` suffix and two `t`s)
+    ToiletWash,
     /// Buys an item from the shop and puts it in the player owned position
     /// specified
     BuyShop {
@@ -529,9 +584,39 @@ pub enum Command {
     },
     /// Spins the wheel. All information about when you can spin, or what you
     /// won are in `game_state.specials.wheel`
+    ///
+    /// **Legacy (pre-32.0):** the 32.0 client no longer sends
+    /// `WheelOfFortune:{payment}` for spinning. It uses
+    /// [`Command::WheelOfFortuneSpin`] instead. This variant is kept so that
+    /// existing code keeps compiling.
     SpinWheelOfFortune {
         /// The resource you want to spend to spin the wheel
         payment: FortunePayment,
+    },
+    /// Requests the state/configuration of the wheel for a given turn type
+    /// (client 32.0 `WheelOfFortune`, request field `turnType`).
+    ///
+    /// The exact wire serialization (`ToString`) and the numeric enum values
+    /// were not recoverable from the metadata dump; the mapping follows the
+    /// crate convention `Name:number`.
+    WheelOfFortune {
+        /// The way the client intends to pay for a turn
+        turn_type: WheelTurnType,
+    },
+    /// Enters the wheel screen (client 32.0 `WheelOfFortuneEnter`, request
+    /// field `SendConfigResponse`)
+    WheelOfFortuneEnter {
+        /// Whether the client asks the server for the wheel configuration as
+        /// part of the response
+        send_config_response: bool,
+    },
+    /// Spins a specific wheel (client 32.0 `WheelOfFortuneSpin`, request
+    /// fields `WheelType` and `WheelTurnType`)
+    WheelOfFortuneSpin {
+        /// Which wheel to spin
+        wheel_type: WheelType,
+        /// The way the turn is paid for
+        turn_type: WheelTurnType,
     },
     /// Collects the reward for event points
     CollectEventTaskReward {
@@ -736,10 +821,20 @@ pub enum Command {
     /// Switch equipment with the mannequin, if it is unlocked
     SwapMannequin,
     /// Updates your flag in the Hall of Fame
+    ///
+    /// **Legacy:** the 32.0 client does not send `PlayerSetFlag` (it is not in
+    /// `RequestNames`); player settings go through
+    /// [`Command::UserSettingsUpdate`]. The wire string is kept unchanged
+    /// because it may still be a server-side alias.
     UpdateFlag {
         flag: Option<Flag>,
     },
     /// Changes if you can receive invites or not
+    ///
+    /// **Legacy:** the 32.0 client does not send `PlayerSetNoGroupInvite` (not
+    /// in `RequestNames`); player settings go through
+    /// [`Command::UserSettingsUpdate`]. The wire string is kept unchanged
+    /// because it may still be a server-side alias.
     BlockGuildInvites {
         block_invites: bool,
     },
@@ -766,6 +861,11 @@ pub enum Command {
     /// valid country code. I have not tested all, but it should be one of:
     /// `ru,fi,ar,tr,nl,ja,it,sk,fr,ko,pl,cs,el,da,en,hr,de,zh,sv,hu,pt,es,
     /// pt-br, ro`
+    ///
+    /// **Legacy:** the 32.0 client does not send `AccountSetLanguage` (not in
+    /// `RequestNames`); it uses [`Command::SetClientLanguage`], which maps to
+    /// `UserSettingsUpdate`. The wire string is kept unchanged because it may
+    /// still be a server-side alias.
     #[deprecated = "Use the 'SetClientLanguage' enum instead"]
     SetLanguage {
         language: String,
@@ -791,6 +891,10 @@ pub enum Command {
     /// mushrooms. Note that this is NOT the normal model id. it is the
     /// `model_id + (class as usize) * 1000` if I remember correctly. Pretty
     /// sure nobody will ever use this though, as it is only for looks.
+    ///
+    /// **Legacy:** the 32.0 client does not send `ItemChangePicture` (not in
+    /// `RequestNames`). The wire string is kept unchanged because it may still
+    /// be a server-side alias.
     ChangeItemLook {
         inv: ItemPlace,
         pos: usize,
@@ -908,6 +1012,21 @@ pub enum Command {
     SetClientLanguage {
         language: Language,
     },
+    /// Changes the language of the guild (client 32.0 `GroupSetLanguage`,
+    /// request name index 28195)
+    GroupSetLanguage {
+        /// The language the guild should use
+        language: Language,
+    },
+    /// Generic player-settings update (client 32.0 `UserSettingsUpdate`,
+    /// request name index 28243). The setting/value schema was not recovered
+    /// from the client metadata, so the raw `/`-separated arguments are passed
+    /// through unchanged.
+    UserSettingsUpdate {
+        /// Raw settings arguments in wire order (for example the already
+        /// modelled `1/<language>` of [`Command::SetClientLanguage`])
+        arguments: Vec<String>,
+    },
     HellevatorEnter,
     HellevatorViewGuildRanking,
     HellevatorFight {
@@ -941,6 +1060,270 @@ pub enum Command {
     BuyGoldFrame,
     LegendaryDungeonMonsterFight,
     LegendaryDungeonMonsterEscape,
+    /// Fights one of the class dungeons ("Class World"), which unlock at
+    /// level 250. The response is parsed like a normal dungeon fight, so
+    /// `last_fight` and the regular `dungeonprogresslight` values are updated
+    /// as usual
+    ///
+    /// **NOTE:** The server reuses the light dungeon wire command for this
+    /// (`PlayerDungeonBattle`), therefore `class_dungeon` is the raw dungeon
+    /// game id sent verbatim and NOT a `LightDungeon`. Unlike
+    /// [`Command::FightDungeon`], no `+1` offset is applied here. The exact
+    /// per-class ids were not determinable via static analysis of the
+    /// available artifacts; they have to be supplied by the caller
+    FightClassDungeon {
+        /// The raw game id of the class dungeon you want to fight
+        class_dungeon: u32,
+        /// If this is true, you will spend a mushroom, if the timer has not
+        /// run out. Note, that this is currently ignored by the server for
+        /// some reason
+        use_mushroom: bool,
+    },
+    /// Shop catalog request (client 32.0 `GetShopCatalog`, request name index
+    /// 28213; request class fields `Platform` and `BlackmarketOffers`).
+    ///
+    /// **NOTE:** the wire order and encoding were not recovered from the
+    /// client metadata; the mapping uses the declaration order and the numeric
+    /// `AppStore` value.
+    GetShopCatalog {
+        /// The store platform the client reports
+        platform: AppStore,
+        /// Whether the blackmarket offers should be included
+        blackmarket_offers: bool,
+    },
+    /// Initializes a shop purchase (client 32.0 `ShopInit`, request name index
+    /// 28215; request class fields `Platform`, `ProductID`, `Currency`,
+    /// `Description`, `UserID`).
+    ///
+    /// **NOTE:** the wire order and encoding were not recovered; the mapping
+    /// uses the declaration order.
+    ShopInit {
+        /// The field values of the client request
+        request: ShopInitRequest,
+    },
+    /// Pre-checks a shop purchase (client 32.0 `ShopPreCheckout`, request name
+    /// index 28217). The request fields were not fetched during the analysis,
+    /// so the raw `/`-separated arguments are passed through.
+    ShopPreCheckout {
+        /// Raw checkout arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Checks out a shop purchase (client 32.0 `ShopCheckout`, request name
+    /// index 28214; request class fields `Platform`, `ProductID`, `Locale`,
+    /// `Description`, `FreeOrPayedWithInGameCurrency`, `Signature`,
+    /// `TransactionUUID`, `Currency`, `IOSStorefrontLocation`).
+    ///
+    /// **NOTE:** the wire order and encoding were not recovered; the mapping
+    /// uses the declaration order.
+    ShopCheckout {
+        /// The field values of the client request
+        request: ShopCheckoutRequest,
+    },
+    /// Opens the S&F homepage link in the current shop flow (client 32.0
+    /// `SFHomeLink`, request name index 28216). No request fields are known.
+    SFHomeLink,
+    /// World boss ranking, world scope (client 32.0 `WorldBossRankingWorld`,
+    /// request name index 28265). Parameter schema not recovered.
+    WorldBossRankingWorld {
+        /// Raw ranking arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// World boss ranking, fighter scope (client 32.0
+    /// `WorldBossRankingFighter`, request name index 28266). Parameter schema
+    /// not recovered.
+    WorldBossRankingFighter {
+        /// Raw ranking arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// World boss ranking, international scope (client 32.0
+    /// `WorldBossRankingInternational`, request name index 28267). Parameter
+    /// schema not recovered.
+    WorldBossRankingInternational {
+        /// Raw ranking arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// World boss ranking reward preview, world scope (client 32.0
+    /// `WorldBossRankingWorldRewards`, request name index 28271). Parameter
+    /// schema not recovered.
+    WorldBossRankingWorldRewards {
+        /// Raw ranking arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// World boss ranking reward preview, international scope (client 32.0
+    /// `WorldBossRankingInternationalRewards`, request name index 28272).
+    /// Parameter schema not recovered.
+    WorldBossRankingInternationalRewards {
+        /// Raw ranking arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// World boss reward log (client 32.0 `WorldBossLogRewards`, request name
+    /// index 28268). Parameter schema not recovered.
+    WorldBossLogRewards {
+        /// Raw log arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// World boss day info log (client 32.0 `WorldBossLogDayInfos`, request
+    /// name index 28269). Parameter schema not recovered.
+    WorldBossLogDayInfos {
+        /// Raw log arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Rerolls the currently offered world boss upgrade (client 32.0
+    /// `WorldBossUpgradeReroll`, request name index 28270). Parameter schema
+    /// not recovered.
+    WorldBossUpgradeReroll {
+        /// Raw reroll arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Joins the circus event (client 32.0 `CircusJoin`, request name index
+    /// 28251). Parameter schema not recovered.
+    CircusJoin {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Starts a circus battle (client 32.0 `CircusStartBattle`, request name
+    /// index 28247). Parameter schema not recovered.
+    CircusStartBattle {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Sets the circus monster multiplier mode (client 32.0
+    /// `CircusSetMonsterMultiplierMode`, request name index 28246). Parameter
+    /// schema not recovered.
+    CircusSetMonsterMultiplierMode {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Previews the circus reward (client 32.0 `CircusPreviewReward`, request
+    /// name index 28248). Parameter schema not recovered.
+    CircusPreviewReward {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Daily circus ranking (client 32.0 `CircusRankingDaily`, request name
+    /// index 28249). Parameter schema not recovered.
+    CircusRankingDaily {
+        /// Raw ranking arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Total circus ranking (client 32.0 `CircusRankingTotal`, request name
+    /// index 28250). Parameter schema not recovered.
+    CircusRankingTotal {
+        /// Raw ranking arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Polls the deeds & titles state (client 32.0 `DeedsAndTitlesPoll`,
+    /// request name index 28273). Parameter schema not recovered.
+    DeedsAndTitlesPoll {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches deeds & titles info (client 32.0 `DeedsAndTitlesGetInfos`,
+    /// request name index 28274). Parameter schema not recovered.
+    DeedsAndTitlesGetInfos {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches global deeds & titles info (client 32.0
+    /// `DeedsAndTitlesGetInfosGlobal`, request name index 28275). Parameter
+    /// schema not recovered.
+    DeedsAndTitlesGetInfosGlobal {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Sets the active title (client 32.0 `DeedsAndTitlesSetTitle`, request
+    /// name index 28276). Parameter schema not recovered.
+    DeedsAndTitlesSetTitle {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Sets the active trophy (client 32.0 `DeedsAndTitlesSetTrophy`, request
+    /// name index 28277). Parameter schema not recovered.
+    DeedsAndTitlesSetTrophy {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Sets the trophy shelf (client 32.0 `DeedsAndTitlesSetTrophyShelf`,
+    /// request name index 28278). Parameter schema not recovered.
+    DeedsAndTitlesSetTrophyShelf {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches the deeds hall of fame (client 32.0
+    /// `DeedsAndTitlesDeedsGetHallOfFame`, request name index 28279).
+    /// Parameter schema not recovered.
+    DeedsAndTitlesDeedsGetHallOfFame {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches the global deeds hall of fame (client 32.0
+    /// `DeedsAndTitlesDeedsGetHallOfFameGlobal`, request name index 28280).
+    /// Parameter schema not recovered.
+    DeedsAndTitlesDeedsGetHallOfFameGlobal {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Claims all pending player messages (client 32.0
+    /// `PlayerMessageClaimAll`, request name index 28242). Parameter schema
+    /// not recovered.
+    PlayerMessageClaimAll {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches combat-log dungeon info (client 32.0
+    /// `PlayerCombatLogDungeonInfo`, request name index 28253). Parameter
+    /// schema not recovered.
+    PlayerCombatLogDungeonInfo {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches the Twitch auth token (client 32.0 `PlayerTwitchAuthtoken`,
+    /// request name index 28255). Parameter schema not recovered.
+    PlayerTwitchAuthtoken {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Reports completed advertisements (client 32.0
+    /// `AdvertisementsCompleted`, request name index 28256). Parameter schema
+    /// not recovered.
+    AdvertisementsCompleted {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches a Helpshift token (client 32.0 `GetHelpshiftToken`, request
+    /// name index 28212). Parameter schema not recovered.
+    GetHelpshiftToken {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Redeems a beta code (client 32.0 `BetaRedeemCode`, request name index
+    /// 28075). Parameter schema not recovered.
+    BetaRedeemCode {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Chooses a beta preset (client 32.0 `BetaChoosePreset`, request name
+    /// index 28076). Parameter schema not recovered.
+    BetaChoosePreset {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Fetches the server version (client 32.0 `GetServerVersion`, request
+    /// name index 28050). Parameter schema not recovered.
+    GetServerVersion {
+        /// Raw arguments in wire order
+        arguments: Vec<String>,
+    },
+    /// Wraps an existing command and attaches explicit per-request metadata
+    /// (see [`RequestMetadata`]). The inner command supplies the request
+    /// string; the metadata is honored by [`crate::session::Session`] when
+    /// building the URL and when applying throttling.
+    WithMetadata {
+        /// The command to send
+        command: Box<Command>,
+        /// The metadata to apply to this request
+        metadata: RequestMetadata,
+    },
 }
 
 /// This is the "Questing instead of expeditions" value in the settings
@@ -975,6 +1358,30 @@ pub enum FortunePayment {
     LuckyCoins = 0,
     Mushrooms,
     FreeTurn,
+}
+
+/// How a wheel turn is paid for (client 32.0 enum `WheelTurnType`,
+/// `PlayaGames.ShakesAndFidget.Network.Requests`).
+///
+/// The numeric values follow the declaration order observed in the client
+/// metadata; they were not verified against the compiled enum constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, FromPrimitive)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(missing_docs)]
+pub enum WheelTurnType {
+    /// No payment / not specified
+    #[default]
+    None = 0,
+    /// Pay with a mushroom
+    UseMushroom,
+    /// Pay with a lucky coin / token
+    UseToken,
+    /// Watch a video ad
+    VideoAd,
+    /// Free turn
+    Free,
+    /// Turn granted by a subscription
+    Subscription,
 }
 
 /// The price you have to pay to roll the dice
@@ -1063,6 +1470,21 @@ pub enum IdleUpgradeAmount {
 }
 
 impl Command {
+    /// Returns the per-request metadata used when building the request URL and
+    /// when applying throttling.
+    ///
+    /// The official client keeps these values on `ARequest`. Their concrete
+    /// per-request values could not be recovered from the metadata dump, so
+    /// every command uses conservative defaults; wrap a command in
+    /// [`Command::WithMetadata`] to override them.
+    #[must_use]
+    pub fn request_metadata(&self) -> RequestMetadata {
+        match self {
+            Self::WithMetadata { metadata, .. } => *metadata,
+            _ => RequestMetadata::default(),
+        }
+    }
+
     /// Returns the unencrypted string, that has to be sent to the server to
     /// perform the request
     #[allow(deprecated, clippy::useless_format)]
@@ -1227,6 +1649,7 @@ impl Command {
             Command::GuildRaid => format!("GroupRaidDeclare:"),
             Command::ToiletFlush => format!("PlayerToilettFlush:"),
             Command::ToiletOpen => format!("PlayerToilettOpenWithKey:"),
+            Command::ToiletWash => format!("PlayerToilettWashRequest:"),
             Command::FightTower {
                 current_level: progress,
                 use_mush,
@@ -1325,7 +1748,7 @@ impl Command {
                 *action as usize
             ),
             Command::BlacksmithUpgradeItem { item_pos, amount } => {
-                format!("PlayerItemUpgrade:{item_pos}/{amount}")
+                format!("PlayerSmithUpgradeItem:{item_pos}/{amount}")
             }
             Command::WitchEnchant { enchantment } => {
                 format!("PlayerWitchEnchantItem:{}/1", enchantment.0)
@@ -1365,6 +1788,30 @@ impl Command {
             } => {
                 format!("WheelOfFortune:{}", *fortune_payment as usize)
             }
+            // The 32.0 client splits the old wheel request into
+            // WheelOfFortune / WheelOfFortuneEnter / WheelOfFortuneSpin. The
+            // exact `ToString` layout is not recoverable from metadata; this
+            // uses the crate-wide `Name:number[/number]` convention.
+            Command::WheelOfFortune { turn_type } => {
+                format!("WheelOfFortune:{}", *turn_type as usize)
+            }
+            Command::WheelOfFortuneEnter {
+                send_config_response,
+            } => {
+                format!(
+                    "WheelOfFortuneEnter:{}",
+                    u8::from(*send_config_response)
+                )
+            }
+            Command::WheelOfFortuneSpin {
+                wheel_type,
+                turn_type,
+            } => {
+                format!(
+                    "WheelOfFortuneSpin:{}/{}",
+                    *wheel_type as usize, *turn_type as usize
+                )
+            }
             Command::FortressGather { resource } => {
                 format!("FortressGather:{}", *resource as usize + 1)
             }
@@ -1388,7 +1835,7 @@ impl Command {
                 format!("FortressGemstoneStart:")
             }
             Command::FortressGemStoneSearchCancel => {
-                format!("FortressGemStoneStop:")
+                format!("FortressGemstoneStop:")
             }
             Command::FortressGemStoneSearchFinish { mushrooms } => {
                 format!("FortressGemstoneFinished:{mushrooms}")
@@ -1414,11 +1861,7 @@ impl Command {
             Command::Whisper {
                 player_name: player,
                 message,
-            } => format!(
-                "PlayerMessageWhisper:{}/{}",
-                player,
-                to_sf_string(message)
-            ),
+            } => format!("PlayerWhisper:{}/{}", player, to_sf_string(message)),
             Command::UnderworldCollect { resource } => {
                 format!("UnderworldGather:{}", *resource as usize + 1)
             }
@@ -1675,6 +2118,21 @@ impl Command {
                     }
                 }
             },
+            // The class dungeons ("Class World", level 250+) reuse the light
+            // dungeon wire command. The game id is sent verbatim (wire
+            // format verified against the Mercy fork decompile:
+            // `FightClassDungeon{index, use_mushroom}` ->
+            // `PlayerDungeonBattle:{index}/{use_mushroom}`)
+            Command::FightClassDungeon {
+                class_dungeon,
+                use_mushroom,
+            } => {
+                format!(
+                    "PlayerDungeonBattle:{}/{}",
+                    *class_dungeon,
+                    u8::from(*use_mushroom)
+                )
+            }
             Command::FightPetOpponent {
                 opponent_id,
                 habitat: element,
@@ -1807,6 +2265,149 @@ impl Command {
             }
             Command::SetClientLanguage { language } => {
                 format!("UserSettingsUpdate:1/{}", language.code())
+            }
+            Command::GroupSetLanguage { language } => {
+                format!("GroupSetLanguage:{}", language.code())
+            }
+            Command::UserSettingsUpdate { arguments } => {
+                format!("UserSettingsUpdate:{}", arguments.join("/"))
+            }
+            Command::GetShopCatalog {
+                platform,
+                blackmarket_offers,
+            } => format!(
+                "GetShopCatalog:{}/{}",
+                *platform as u8,
+                u8::from(*blackmarket_offers)
+            ),
+            Command::ShopInit { request } => format!(
+                "ShopInit:{}/{}/{}/{}/{}",
+                request.platform as u8,
+                request.product_id,
+                request.currency,
+                request.description,
+                request.user_id
+            ),
+            Command::ShopPreCheckout { arguments } => {
+                format!("ShopPreCheckout:{}", arguments.join("/"))
+            }
+            Command::ShopCheckout { request } => format!(
+                "ShopCheckout:{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                request.platform as u8,
+                request.product_id,
+                request.locale,
+                request.description,
+                u8::from(request.free_or_payed_with_in_game_currency),
+                request.signature,
+                request.transaction_uuid,
+                request.currency,
+                request.ios_storefront_location
+            ),
+            Command::SFHomeLink => format!("SFHomeLink:"),
+            Command::WorldBossRankingWorld { arguments } => {
+                format!("WorldBossRankingWorld:{}", arguments.join("/"))
+            }
+            Command::WorldBossRankingFighter { arguments } => {
+                format!("WorldBossRankingFighter:{}", arguments.join("/"))
+            }
+            Command::WorldBossRankingInternational { arguments } => {
+                format!("WorldBossRankingInternational:{}", arguments.join("/"))
+            }
+            Command::WorldBossRankingWorldRewards { arguments } => {
+                format!("WorldBossRankingWorldRewards:{}", arguments.join("/"))
+            }
+            Command::WorldBossRankingInternationalRewards { arguments } => {
+                format!(
+                    "WorldBossRankingInternationalRewards:{}",
+                    arguments.join("/")
+                )
+            }
+            Command::WorldBossLogRewards { arguments } => {
+                format!("WorldBossLogRewards:{}", arguments.join("/"))
+            }
+            Command::WorldBossLogDayInfos { arguments } => {
+                format!("WorldBossLogDayInfos:{}", arguments.join("/"))
+            }
+            Command::WorldBossUpgradeReroll { arguments } => {
+                format!("WorldBossUpgradeReroll:{}", arguments.join("/"))
+            }
+            Command::CircusJoin { arguments } => {
+                format!("CircusJoin:{}", arguments.join("/"))
+            }
+            Command::CircusStartBattle { arguments } => {
+                format!("CircusStartBattle:{}", arguments.join("/"))
+            }
+            Command::CircusSetMonsterMultiplierMode { arguments } => {
+                format!(
+                    "CircusSetMonsterMultiplierMode:{}",
+                    arguments.join("/")
+                )
+            }
+            Command::CircusPreviewReward { arguments } => {
+                format!("CircusPreviewReward:{}", arguments.join("/"))
+            }
+            Command::CircusRankingDaily { arguments } => {
+                format!("CircusRankingDaily:{}", arguments.join("/"))
+            }
+            Command::CircusRankingTotal { arguments } => {
+                format!("CircusRankingTotal:{}", arguments.join("/"))
+            }
+            Command::DeedsAndTitlesPoll { arguments } => {
+                format!("DeedsAndTitlesPoll:{}", arguments.join("/"))
+            }
+            Command::DeedsAndTitlesGetInfos { arguments } => {
+                format!("DeedsAndTitlesGetInfos:{}", arguments.join("/"))
+            }
+            Command::DeedsAndTitlesGetInfosGlobal { arguments } => {
+                format!("DeedsAndTitlesGetInfosGlobal:{}", arguments.join("/"))
+            }
+            Command::DeedsAndTitlesSetTitle { arguments } => {
+                format!("DeedsAndTitlesSetTitle:{}", arguments.join("/"))
+            }
+            Command::DeedsAndTitlesSetTrophy { arguments } => {
+                format!("DeedsAndTitlesSetTrophy:{}", arguments.join("/"))
+            }
+            Command::DeedsAndTitlesSetTrophyShelf { arguments } => {
+                format!("DeedsAndTitlesSetTrophyShelf:{}", arguments.join("/"))
+            }
+            Command::DeedsAndTitlesDeedsGetHallOfFame { arguments } => {
+                format!(
+                    "DeedsAndTitlesDeedsGetHallOfFame:{}",
+                    arguments.join("/")
+                )
+            }
+            Command::DeedsAndTitlesDeedsGetHallOfFameGlobal { arguments } => {
+                format!(
+                    "DeedsAndTitlesDeedsGetHallOfFameGlobal:{}",
+                    arguments.join("/")
+                )
+            }
+            Command::PlayerMessageClaimAll { arguments } => {
+                format!("PlayerMessageClaimAll:{}", arguments.join("/"))
+            }
+            Command::PlayerCombatLogDungeonInfo { arguments } => {
+                format!("PlayerCombatLogDungeonInfo:{}", arguments.join("/"))
+            }
+            Command::PlayerTwitchAuthtoken { arguments } => {
+                format!("PlayerTwitchAuthtoken:{}", arguments.join("/"))
+            }
+            Command::AdvertisementsCompleted { arguments } => {
+                format!("AdvertisementsCompleted:{}", arguments.join("/"))
+            }
+            Command::GetHelpshiftToken { arguments } => {
+                format!("GetHelpshiftToken:{}", arguments.join("/"))
+            }
+            Command::BetaRedeemCode { arguments } => {
+                format!("BetaRedeemCode:{}", arguments.join("/"))
+            }
+            Command::BetaChoosePreset { arguments } => {
+                format!("BetaChoosePreset:{}", arguments.join("/"))
+            }
+            Command::GetServerVersion { arguments } => {
+                format!("GetServerVersion:{}", arguments.join("/"))
+            }
+            Command::WithMetadata { command, .. } => {
+                command.request_string()?
             }
         })
     }
@@ -1983,4 +2584,233 @@ generate_language_enum! {
     Spanish => "es",
     Hungarian => "hu",
     Polish => "pl"
+}
+
+#[cfg(all(test, feature = "session"))]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// The class dungeons ("Class World", level 250+) reuse the light dungeon
+    /// wire command with the raw game id. Wire format verified against the
+    /// Mercy fork decompile:
+    /// `FightClassDungeon { index, use_mushroom }` -> `PlayerDungeonBattle:{index}/{use_mushroom}`
+    #[test]
+    fn test_fight_class_dungeon_serialization() {
+        let cmd = Command::FightClassDungeon {
+            class_dungeon: 38,
+            use_mushroom: false,
+        };
+        assert_eq!(cmd.request_string().unwrap(), "PlayerDungeonBattle:38/0");
+
+        let cmd = Command::FightClassDungeon {
+            class_dungeon: 38,
+            use_mushroom: true,
+        };
+        assert_eq!(cmd.request_string().unwrap(), "PlayerDungeonBattle:38/1");
+    }
+
+    /// The class dungeon command shares the wire command with normal light
+    /// dungeons (`PlayerDungeonBattle`), just without the +1 offset the
+    /// `FightDungeon` arm applies to `LightDungeon` values
+    #[test]
+    fn test_fight_class_dungeon_shares_wire_command_with_light_dungeons() {
+        let light = Command::FightDungeon {
+            dungeon: Dungeon::Light(
+                crate::gamestate::dungeons::LightDungeon::DesecratedCatacombs,
+            ),
+            use_mushroom: false,
+        };
+        let class = Command::FightClassDungeon {
+            class_dungeon: 1,
+            use_mushroom: false,
+        };
+        assert_eq!(
+            light.request_string().unwrap(),
+            class.request_string().unwrap()
+        );
+    }
+
+    /// The new variant must round-trip through serde like every other
+    /// command, since `Command` derives Serialize/Deserialize. `sso` is the
+    /// feature that activates the optional `serde_json` dependency in this
+    /// crate
+    #[cfg(feature = "sso")]
+    #[test]
+    fn test_fight_class_dungeon_serde_roundtrip() {
+        let cmd = Command::FightClassDungeon {
+            class_dungeon: 42,
+            use_mushroom: true,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    /// FIX-1: the three 32.0 wheel requests. The exact client `ToString`
+    /// layout is unverified, so these tests pin the crate-wide
+    /// `Name:number[/number]` convention only.
+    #[test]
+    fn test_wheel_of_fortune_32_0_requests() {
+        let cmd = Command::WheelOfFortune {
+            turn_type: WheelTurnType::UseMushroom,
+        };
+        assert_eq!(cmd.request_string().unwrap(), "WheelOfFortune:1");
+
+        let cmd = Command::WheelOfFortuneEnter {
+            send_config_response: true,
+        };
+        assert_eq!(cmd.request_string().unwrap(), "WheelOfFortuneEnter:1");
+
+        let cmd = Command::WheelOfFortuneSpin {
+            wheel_type: WheelType::BasicPlus,
+            turn_type: WheelTurnType::Free,
+        };
+        assert_eq!(cmd.request_string().unwrap(), "WheelOfFortuneSpin:1/4");
+    }
+
+    /// FIX-3, FIX-4, FIX-5 and FIX-7: request names that differ from the
+    /// pre-32.0 fork (verified against `RequestNames` in the analysis).
+    #[test]
+    fn test_renamed_32_0_commands() {
+        let cmd = Command::Whisper {
+            player_name: "Bob".to_string(),
+            message: "hi".to_string(),
+        };
+        assert_eq!(cmd.request_string().unwrap(), "PlayerWhisper:Bob/hi");
+
+        let pos = crate::gamestate::items::PlayerItemPosition {
+            place: crate::gamestate::items::PlayerItemPlace::MainInventory,
+            position: 0,
+        };
+        let cmd = Command::BlacksmithUpgradeItem {
+            item_pos: pos,
+            amount: 2,
+        };
+        assert_eq!(
+            cmd.request_string().unwrap(),
+            "PlayerSmithUpgradeItem:2/1/2"
+        );
+
+        assert_eq!(
+            Command::ToiletWash.request_string().unwrap(),
+            "PlayerToilettWashRequest:"
+        );
+
+        assert_eq!(
+            Command::FortressGemStoneSearchCancel
+                .request_string()
+                .unwrap(),
+            "FortressGemstoneStop:"
+        );
+    }
+
+    /// FIX-8: shop requests and the `AppStore` encoding.
+    #[test]
+    fn test_shop_requests() {
+        let cmd = Command::GetShopCatalog {
+            platform: AppStore::Steam,
+            blackmarket_offers: true,
+        };
+        assert_eq!(cmd.request_string().unwrap(), "GetShopCatalog:3/1");
+
+        let cmd = Command::ShopInit {
+            request: ShopInitRequest {
+                platform: AppStore::Android,
+                product_id: "product".to_string(),
+                currency: "EUR".to_string(),
+                description: "desc".to_string(),
+                user_id: "user".to_string(),
+            },
+        };
+        assert_eq!(
+            cmd.request_string().unwrap(),
+            "ShopInit:1/product/EUR/desc/user"
+        );
+
+        let cmd = Command::ShopPreCheckout {
+            arguments: vec!["1".to_string(), "product".to_string()],
+        };
+        assert_eq!(cmd.request_string().unwrap(), "ShopPreCheckout:1/product");
+
+        assert_eq!(
+            Command::SFHomeLink.request_string().unwrap(),
+            "SFHomeLink:"
+        );
+    }
+
+    /// FIX-13: newly added command families use the client request names
+    /// verbatim and pass unknown parameters through unchanged.
+    #[test]
+    fn test_new_32_0_command_families() {
+        let cmd = Command::WorldBossRankingWorld {
+            arguments: vec!["0".to_string()],
+        };
+        assert_eq!(cmd.request_string().unwrap(), "WorldBossRankingWorld:0");
+
+        let cmd = Command::WorldBossUpgradeReroll {
+            arguments: Vec::new(),
+        };
+        assert_eq!(cmd.request_string().unwrap(), "WorldBossUpgradeReroll:");
+
+        let cmd = Command::CircusRankingTotal {
+            arguments: vec!["1".to_string()],
+        };
+        assert_eq!(cmd.request_string().unwrap(), "CircusRankingTotal:1");
+
+        let cmd = Command::DeedsAndTitlesSetTrophyShelf {
+            arguments: vec!["2".to_string(), "3".to_string()],
+        };
+        assert_eq!(
+            cmd.request_string().unwrap(),
+            "DeedsAndTitlesSetTrophyShelf:2/3"
+        );
+
+        let cmd = Command::PlayerMessageClaimAll {
+            arguments: Vec::new(),
+        };
+        assert_eq!(cmd.request_string().unwrap(), "PlayerMessageClaimAll:");
+
+        let cmd = Command::GetServerVersion {
+            arguments: Vec::new(),
+        };
+        assert_eq!(cmd.request_string().unwrap(), "GetServerVersion:");
+
+        let cmd = Command::GroupSetLanguage {
+            language: Language::Polish,
+        };
+        assert_eq!(cmd.request_string().unwrap(), "GroupSetLanguage:pl");
+
+        let cmd = Command::UserSettingsUpdate {
+            arguments: vec!["1".to_string(), "pl".to_string()],
+        };
+        assert_eq!(cmd.request_string().unwrap(), "UserSettingsUpdate:1/pl");
+    }
+
+    /// FIX-10: metadata defaults preserve the old behavior and
+    /// `WithMetadata` overrides them per request.
+    #[test]
+    fn test_request_metadata() {
+        let default = Command::Update.request_metadata();
+        assert!(default.needs_session_id);
+        assert_eq!(default.min_parameters, None);
+        assert!(!default.parameterless);
+        assert_eq!(default.response_delay, None);
+        assert!(!default.has_jwt_header);
+
+        let metadata = RequestMetadata {
+            needs_session_id: false,
+            min_parameters: Some(0),
+            parameterless: true,
+            response_delay: Some(std::time::Duration::from_millis(1)),
+            has_jwt_header: true,
+        };
+        let cmd = Command::WithMetadata {
+            command: Box::new(Command::Update),
+            metadata,
+        };
+        assert_eq!(cmd.request_metadata(), metadata);
+        assert_eq!(cmd.request_string().unwrap(), "Poll:");
+    }
 }

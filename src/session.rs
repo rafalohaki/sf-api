@@ -40,6 +40,18 @@ pub struct Session {
     // that you create one and reuse it."
     client: reqwest::Client,
     options: ConnectionOptions,
+    /// Optional JWT header, attached to requests whose
+    /// [`crate::command::RequestMetadata::has_jwt_header`] is set.
+    ///
+    /// The exact header name used by the official client could not be
+    /// recovered from metadata (only `RequestHelper.SetJWTHeader` and
+    /// `ARequest.get_HasJTWHeader` are known), so the caller supplies both the
+    /// name and the value.
+    jwt_header: Option<(HeaderName, HeaderValue)>,
+    /// Optional SSO domain header attached to every request when configured
+    /// (client `RequestHelper.SetSSODomainHeader`). The concrete header name
+    /// was not recovered from metadata and is supplied by the caller.
+    sso_domain_header: Option<(HeaderName, HeaderValue)>,
 }
 
 /// The password of a character, hashed in the way, that the server expects
@@ -112,7 +124,66 @@ impl Session {
             login_count: 1,
             options,
             player_id: 0,
+            jwt_header: None,
+            sso_domain_header: None,
         }
+    }
+
+    /// Configures the JWT header that is attached to requests whose
+    /// [`crate::command::RequestMetadata::has_jwt_header`] flag is set.
+    ///
+    /// The official client has a per-request `HasJTWHeader` flag and a
+    /// `RequestHelper.SetJWTHeader` helper, but the concrete header name could
+    /// not be recovered from static metadata, so it is provided by the caller.
+    ///
+    /// # Errors
+    /// Returns `InvalidRequest` if `name` or `value` is not a valid HTTP
+    /// header name/value.
+    pub fn set_jwt_header(
+        &mut self,
+        name: &str,
+        value: &str,
+    ) -> Result<(), SFError> {
+        let name = HeaderName::from_str(name)
+            .map_err(|_| SFError::InvalidRequest("Invalid JWT header name"))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| SFError::InvalidRequest("Invalid JWT header value"))?;
+        self.jwt_header = Some((name, value));
+        Ok(())
+    }
+
+    /// Removes a previously configured JWT header.
+    pub fn clear_jwt_header(&mut self) {
+        self.jwt_header = None;
+    }
+
+    /// Configures an SSO domain header that is attached to every request
+    /// (client `RequestHelper.SetSSODomainHeader`).
+    ///
+    /// The concrete header name could not be recovered from static metadata,
+    /// so it is provided by the caller.
+    ///
+    /// # Errors
+    /// Returns `InvalidRequest` if `name` or `value` is not a valid HTTP
+    /// header name/value.
+    pub fn set_sso_domain_header(
+        &mut self,
+        name: &str,
+        value: &str,
+    ) -> Result<(), SFError> {
+        let name = HeaderName::from_str(name).map_err(|_| {
+            SFError::InvalidRequest("Invalid SSO domain header name")
+        })?;
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            SFError::InvalidRequest("Invalid SSO domain header value")
+        })?;
+        self.sso_domain_header = Some((name, value));
+        Ok(())
+    }
+
+    /// Removes a previously configured SSO domain header.
+    pub fn clear_sso_domain_header(&mut self) {
+        self.sso_domain_header = None;
     }
 
     /// Resets a session by setting all values related to the server connection
@@ -241,18 +312,49 @@ impl Session {
         let command = command.borrow();
         trace!("Sending a {command:?} command");
 
+        let metadata = command.request_metadata();
+        if let Some(delay) = metadata.response_delay {
+            trace!("Delaying request by {delay:?} as requested");
+            tokio::time::sleep(delay).await;
+        }
+
         let old_cmd = command.request_string()?;
         trace!("Command string: {old_cmd}");
 
         let (cmd_name, cmd_args) =
             old_cmd.split_once(':').unwrap_or((old_cmd.as_str(), ""));
 
-        let url = format!(
-            "{}cmd.php?req={cmd_name}&params={}&sid={}",
-            self.server_url,
-            base64::engine::general_purpose::URL_SAFE.encode(cmd_args),
-            self.crypto_id,
-        );
+        let parameter_count = if cmd_args.is_empty() {
+            0
+        } else {
+            cmd_args.split('/').count()
+        };
+        if metadata.parameterless && parameter_count != 0 {
+            return Err(SFError::InvalidRequest(
+                "This request must not have parameters",
+            ));
+        }
+        if let Some(min_parameters) = metadata.min_parameters
+            && parameter_count < min_parameters
+        {
+            return Err(SFError::InvalidRequest(
+                "Not enough parameters for this request",
+            ));
+        }
+
+        let encoded_params =
+            base64::engine::general_purpose::URL_SAFE.encode(cmd_args);
+        let url = if metadata.needs_session_id {
+            format!(
+                "{}cmd.php?req={cmd_name}&params={encoded_params}&sid={}",
+                self.server_url, self.crypto_id,
+            )
+        } else {
+            format!(
+                "{}cmd.php?req={cmd_name}&params={encoded_params}",
+                self.server_url,
+            )
+        };
 
         trace!("Full request url: {url}");
 
@@ -284,6 +386,18 @@ impl Session {
             HeaderValue::from_str(&self.player_id.to_string())
                 .map_err(|_| SFError::InvalidRequest("Invalid player id"))?,
         );
+
+        // Client 32.0 `RequestHelper.SetSSODomainHeader`
+        if let Some((name, value)) = &self.sso_domain_header {
+            req = req.header(name, value);
+        }
+        // Client 32.0 `ARequest.get_HasJTWHeader` +
+        // `RequestHelper.SetJWTHeader`
+        if metadata.has_jwt_header
+            && let Some((name, value)) = &self.jwt_header
+        {
+            req = req.header(name, value);
+        }
 
         let resp = req.send().await.map_err(|_| SFError::ConnectionError)?;
 

@@ -140,6 +140,35 @@ impl Response {
         self.borrow_body()
     }
 
+    /// Returns the raw value of the client's `messages` response layer, if the
+    /// server sent one.
+    ///
+    /// The 32.0 client parses this into typed messages (`Response.Messages` /
+    /// `RawMessages`, `TryGetMessage`, `GetMessageType`, ...). The wire
+    /// semantics of that layer were not established statically, so this
+    /// accessor deliberately exposes the raw value only instead of guessing a
+    /// message format.
+    #[must_use]
+    pub fn messages_raw(&self) -> Option<&str> {
+        self.values().get("messages").map(ResponseVal::as_str)
+    }
+
+    /// Returns the raw value of the client's `rawmessages` response layer, if
+    /// the server sent one.
+    ///
+    /// See [`Self::messages_raw`] for why this is raw.
+    #[must_use]
+    pub fn raw_messages_raw(&self) -> Option<&str> {
+        self.values().get("rawmessages").map(ResponseVal::as_str)
+    }
+
+    /// Returns `true` if the response contains either of the client's message
+    /// layers (`messages` or `rawmessages`).
+    #[must_use]
+    pub fn has_message_layer(&self) -> bool {
+        self.messages_raw().is_some() || self.raw_messages_raw().is_some()
+    }
+
     /// Returns the time, at which the response was received
     #[must_use]
     pub fn received_at(&self) -> NaiveDateTime {
@@ -318,5 +347,33 @@ impl ResponseVal<'_> {
 impl std::fmt::Display for ResponseVal<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::Response;
+
+    /// FIX-11: the client's message layers are exposed raw, because their wire
+    /// semantics were not established statically.
+    #[test]
+    fn test_message_layer_accessors() {
+        let body = "messages:hello&rawmessages:raw".to_string();
+        let resp =
+            Response::parse(body, chrono::Local::now().naive_local()).unwrap();
+        assert_eq!(resp.messages_raw(), Some("hello"));
+        assert_eq!(resp.raw_messages_raw(), Some("raw"));
+        assert!(resp.has_message_layer());
+    }
+
+    #[test]
+    fn test_missing_message_layer() {
+        let body = "success:1".to_string();
+        let resp =
+            Response::parse(body, chrono::Local::now().naive_local()).unwrap();
+        assert_eq!(resp.messages_raw(), None);
+        assert!(!resp.has_message_layer());
     }
 }

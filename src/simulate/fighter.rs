@@ -1096,10 +1096,17 @@ impl ClassData {
 
     pub(crate) fn new(main: &Fighter, opponent: &Fighter) -> ClassData {
         let mut res = match main.class {
-            Class::Warrior if main.is_companion => {
+            Class::Warrior | Class::Bert if main.is_companion => {
                 ClassData::Warrior { block_chance: 0 }
             }
-            Class::Warrior => ClassData::Warrior { block_chance: 25 },
+            // NOTE: the client metadata provides no combat formulas for
+            // `Class.Bert`; mirror Warrior only so `ClassData` can be built.
+            // Such fights are flagged unmodelled via `Class::combat_model_known`
+            // / `FightSimulationResult::model_known` — consumers must not trust
+            // the win ratio (L1.9:193/196).
+            Class::Warrior | Class::Bert => {
+                ClassData::Warrior { block_chance: 25 }
+            }
             Class::Mage => ClassData::Mage,
             Class::Scout => ClassData::Scout,
             Class::Assassin => ClassData::Assassin {

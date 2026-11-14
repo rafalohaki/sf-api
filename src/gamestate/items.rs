@@ -671,6 +671,9 @@ impl Item {
 
         match class {
             Warrior | Paladin | BloodWeaver => class_requirement == Warrior,
+            // NOTE: the client metadata provides no equipment rules for
+            // `Class.Bert`; mirror Warrior until real data is available.
+            Bert => class_requirement == Warrior,
             Berserker => class_requirement == Warrior && !self.typ.is_shield(),
             Scout => class_requirement == Scout,
             Mage | Necromancer => class_requirement == Mage,

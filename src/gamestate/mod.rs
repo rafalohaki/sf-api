@@ -8,6 +8,7 @@ pub mod idle;
 pub mod items;
 pub mod legendary_dungeon;
 pub mod rewards;
+pub mod shop;
 pub mod social;
 pub mod tavern;
 pub mod underworld;

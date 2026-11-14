@@ -146,12 +146,17 @@ pub enum Gender {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, FromPrimitive, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum Class {
     #[default]
     Warrior = 0,
     Mage,
     Scout,
     Assassin,
+    /// The client calls this class `Warlock`. The variant keeps the old name
+    /// so existing code does not break; `Warlock` is accepted as a serde
+    /// alias when deserializing.
+    #[cfg_attr(feature = "serde", serde(alias = "Warlock"))]
     BattleMage,
     Berserker,
     DemonHunter,
@@ -161,6 +166,14 @@ pub enum Class {
     Paladin,
     PlagueDoctor,
     BloodWeaver,
+    /// Client 32.0 `Class.Bert` (wire 14, discriminant 13).
+    ///
+    /// **NOTE:** the client metadata provides no stats/skill formulas for this
+    /// class. The `impl Class` helpers below use the Warrior values as
+    /// placeholders and must be corrected once real data is available; the
+    /// simulator flags this class as unmodelled via `Class::combat_model_known`
+    /// / `FightSimulationResult::model_known` (no fabricated win chances).
+    Bert,
 }
 
 #[allow(clippy::enum_glob_use)]
@@ -170,7 +183,7 @@ impl Class {
     pub fn main_attribute(&self) -> AttributeType {
         use Class::*;
         match self {
-            BloodWeaver | Paladin | BattleMage | Berserker | Warrior => {
+            BloodWeaver | Paladin | BattleMage | Berserker | Warrior | Bert => {
                 AttributeType::Strength
             }
             Assassin | DemonHunter | Scout | PlagueDoctor => {
@@ -187,7 +200,7 @@ impl Class {
         use Class::*;
         match self {
             PlagueDoctor | Paladin | Warrior | Assassin | BattleMage
-            | Berserker | BloodWeaver => 2.0,
+            | Berserker | BloodWeaver | Bert => 2.0,
             Scout | DemonHunter => 2.5,
             Mage | Druid | Bard | Necromancer => 4.5,
         }
@@ -222,7 +235,7 @@ impl Class {
 
         match self {
             Warrior if is_companion => 6.1,
-            Warrior | BattleMage | Druid | BloodWeaver => 5.0,
+            Warrior | BattleMage | Druid | BloodWeaver | Bert => 5.0,
             Paladin => 6.0,
             PlagueDoctor | Scout | Assassin | Berserker | DemonHunter
             | Necromancer => 4.0,
@@ -247,7 +260,8 @@ impl Class {
             Class::Warrior
             | Class::BattleMage
             | Class::DemonHunter
-            | Class::Bard => 50,
+            | Class::Bard
+            | Class::Bert => 50,
             Class::Paladin => 45,
             Class::Scout
             | Class::Assassin
@@ -274,6 +288,20 @@ impl Class {
     #[must_use]
     pub fn can_wear_shield(self) -> bool {
         matches!(self, Self::Paladin | Self::Warrior)
+    }
+
+    /// Is this class' combat model published in the client metadata?
+    ///
+    /// Lesson L1.9:193: a class enters the simulator only once its values are
+    /// published. `Bert` has no stats/skill formulas yet — the `impl Class`
+    /// helpers above are Warrior placeholders. The simulator reports such
+    /// fights as unmodelled (`FightSimulationResult::model_known == false`)
+    /// so consumers answer "cannot evaluate" instead of fabricating a win
+    /// chance (lesson L1.9:196).
+    #[cfg(feature = "simulation")]
+    #[must_use]
+    pub(crate) fn combat_model_known(self) -> bool {
+        !matches!(self, Class::Bert)
     }
 }
 
@@ -345,5 +373,23 @@ impl Mount {
                 mushrooms: 25,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use num_traits::FromPrimitive;
+
+    use super::Class;
+
+    /// FIX-12: client 32.0 added `Class.Bert` as wire value 14, i.e.
+    /// discriminant 13 under the crate's `*class as usize + 1` convention.
+    #[test]
+    fn test_bert_is_wire_14() {
+        assert_eq!(Class::Bert as usize + 1, 14);
+        assert_eq!(Class::from_i64(13), Some(Class::Bert));
+        assert_eq!(Class::BloodWeaver as usize + 1, 13);
     }
 }
