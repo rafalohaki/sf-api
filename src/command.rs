@@ -1360,6 +1360,40 @@ pub enum FortunePayment {
     FreeTurn,
 }
 
+/// Maps a legacy [`FortunePayment`] onto the client-32.0 [`WheelTurnType`].
+///
+/// The pre-32.0 request carried the payment as a single number; 32.0 sends a
+/// dedicated turn type instead. `LuckyCoins` becomes [`WheelTurnType::UseToken`]
+/// because lucky coins *are* the wheel tokens, `Mushrooms` becomes
+/// [`WheelTurnType::UseMushroom`] and `FreeTurn` stays [`WheelTurnType::Free`].
+///
+/// Lossy in one direction only: [`WheelTurnType::None`], `VideoAd` and
+/// `Subscription` have no legacy equivalent — see
+/// [`Self::legacy_payment`] for the reverse mapping.
+impl From<FortunePayment> for WheelTurnType {
+    fn from(payment: FortunePayment) -> Self {
+        match payment {
+            FortunePayment::LuckyCoins => WheelTurnType::UseToken,
+            FortunePayment::Mushrooms => WheelTurnType::UseMushroom,
+            FortunePayment::FreeTurn => WheelTurnType::Free,
+        }
+    }
+}
+
+impl FortunePayment {
+    /// The legacy payment for a 32.0 turn type, or `None` when the turn type
+    /// has no pre-32.0 request (video ads, subscription turns, unspecified).
+    #[must_use]
+    pub const fn legacy_payment(turn_type: WheelTurnType) -> Option<Self> {
+        match turn_type {
+            WheelTurnType::UseToken => Some(Self::LuckyCoins),
+            WheelTurnType::UseMushroom => Some(Self::Mushrooms),
+            WheelTurnType::Free => Some(Self::FreeTurn),
+            WheelTurnType::None | WheelTurnType::VideoAd | WheelTurnType::Subscription => None,
+        }
+    }
+}
+
 /// How a wheel turn is paid for (client 32.0 enum `WheelTurnType`,
 /// `PlayaGames.ShakesAndFidget.Network.Requests`).
 ///
