@@ -398,6 +398,24 @@ pub struct Witch {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnchantmentIdent(pub(crate) NonZeroU8);
 
+impl EnchantmentIdent {
+    /// Builds an ident from the raw character specific value (1-based;
+    /// `None` for 0 — the server never sends a zero ident).
+    #[must_use]
+    pub const fn new(value: u8) -> Option<Self> {
+        match NonZeroU8::new(value) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// The raw character specific value the witch expects.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0.get()
+    }
+}
+
 impl Witch {
     pub(crate) fn update(&mut self, data: &[i64]) -> Result<(), SFError> {
         self.enchantment_price = data.csiget(35, "witch price", u64::MAX)?;
