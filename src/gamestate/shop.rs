@@ -79,8 +79,8 @@ pub struct ShopCheckoutRequest {
     /// The store signature of the purchase
     ///
     /// **Secret**: a payment credential. Deliberately omitted from
-    /// [`std::fmt::Debug`] so `trace!("Sending a {command:?}")` and any
-    /// `{:?}` of a session/command cannot leak it into logs.
+    /// [`std::fmt::Debug`] so any `{:?}` of a session/command cannot leak
+    /// it into logs.
     pub signature: String,
     /// The store transaction uuid
     pub transaction_uuid: String,

@@ -99,8 +99,7 @@ pub enum Command {
         /// The sha1 hashed password of the player
         ///
         /// **Secret**: a replayable login credential. Stored through
-        /// [`SecretString`] so `Debug` (printed by
-        /// `trace!("Sending a {command:?}")`) cannot leak it.
+        /// [`SecretString`] so `Debug` output cannot leak it.
         pw_hash: SecretString,
         /// Honestly, I am not 100% sure what this is anymore, but it is
         /// related to the amount of times you have logged in. Might be useful
@@ -3098,8 +3097,8 @@ mod review_fix_tests {
         assert!(!wire.starts_with("WheelOfFortune:"));
     }
 
-    /// A payment signature is a usable credential: `{:?}` of the command must
-    /// not contain it (it is printed by `trace!("Sending a {command:?}")`).
+    /// A payment signature is a usable credential: `{:?}` of the command
+    /// must never contain it.
     #[test]
     fn shop_checkout_debug_redacts_signature() {
         let cmd = Command::ShopCheckout {
@@ -3123,8 +3122,7 @@ mod review_fix_tests {
 
     /// Login/Register commands carry replayable login credentials (the raw
     /// login string is fully reconstructable from them). `{:?}` of the
-    /// command — printed by `trace!("Sending a {command:?}")` — must never
-    /// contain them.
+    /// command must never contain them.
     #[test]
     fn login_register_command_debug_redacts_credentials() {
         use crate::gamestate::character::{Class, Gender, Race};
