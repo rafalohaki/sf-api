@@ -91,6 +91,12 @@ impl Fight {
         data: &[i64],
         server_time: ServerTime,
     ) -> Result<(), SFError> {
+        // Live f23 (2026-11-15): `UnderworldCollect` odpowiada kluczem
+        // `fightresult` bez wartości — pusty wynik to brak danych, nie błąd
+        // parsowania (wcześniej: TooShortResponse("has_player_won")).
+        if data.is_empty() {
+            return Ok(());
+        }
         self.has_player_won = data.cget(0, "has_player_won")? != 0;
         self.silver_change = data.cget(2, "fight silver change")?;
 
@@ -712,4 +718,19 @@ pub enum FighterTyp {
     UnderworldMinion,
     /// A pet
     Pet,
+}
+
+#[cfg(test)]
+mod empty_result_tests {
+    use super::*;
+
+    /// Live f23: `UnderworldCollect` może odpowiedzieć pustym `fightresult`
+    /// — to brak danych (Ok), nie `TooShortResponse` w pętli odmów.
+    #[test]
+    fn empty_fight_result_is_ok() {
+        let mut fight = Fight::default();
+        assert!(fight.update_result(&[], ServerTime::default()).is_ok());
+        assert!(!fight.has_player_won);
+        assert_eq!(fight.silver_change, 0);
+    }
 }
