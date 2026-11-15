@@ -85,6 +85,15 @@ impl ExpeditionsEvent {
     pub fn active_mut(&mut self) -> Option<&mut Expedition> {
         self.active.as_mut().filter(|a| !a.is_finished())
     }
+
+    /// Is an expedition present but finished (`current_stage() == Finished`,
+    /// e.g. `floor_stage = 4`, `current_floor = 10`)? Live f23: the server
+    /// keeps `action = Expedition` until the client sends
+    /// `ExpeditionContinue` — without this flag the bot waits forever.
+    #[must_use]
+    pub fn active_is_finished(&self) -> bool {
+        self.active.as_ref().is_some_and(Expedition::is_finished)
+    }
 }
 
 /// Information about the current state of the dice game
