@@ -66,7 +66,11 @@ impl Default for FightSimulationResult {
     fn default() -> Self {
         // `model_known: true` — the empty-input short-circuit is not a
         // modelling gap; it is simply no data (win_ratio 0.0).
-        Self { win_ratio: 0.0, won_fights: 0, model_known: true }
+        Self {
+            win_ratio: 0.0,
+            won_fights: 0,
+            model_known: true,
+        }
     }
 }
 
@@ -382,7 +386,10 @@ mod tests {
         let me = fighter_with_class(Class::Warrior);
         let bert = fighter_with_class(Class::Bert);
         let res = simulate_battle(std::slice::from_ref(&me), &[bert], 10, true);
-        assert!(!res.model_known, "Bert has no formulas → model_known = false");
+        assert!(
+            !res.model_known,
+            "Bert has no formulas → model_known = false"
+        );
 
         let mage = fighter_with_class(Class::Mage);
         let res = simulate_battle(&[me], &[mage], 10, true);

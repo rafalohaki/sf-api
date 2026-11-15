@@ -13,7 +13,9 @@ use url::Url;
 use crate::{
     error::SFError,
     misc::sha1_hash,
-    session::{ConnectionOptions, PWHash, Session, reqwest_client},
+    session::{
+        ConnectionOptions, PWHash, Session, read_response_text, reqwest_client,
+    },
 };
 
 #[derive(Debug)]
@@ -33,10 +35,23 @@ pub struct SFAccount {
     pub(super) options: ConnectionOptions,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AccountSession {
     pub(super) uuid: String,
     pub(super) bearer_token: String,
+}
+
+/// The bearer token is a usable SSO credential and the uuid identifies the
+/// account it belongs to; both are redacted, because `SFAccount`/`Session`
+/// derive `Debug` and must not leak them into logs or panic messages. The
+/// values themselves stay reachable through the fields.
+impl std::fmt::Debug for AccountSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountSession")
+            .field("uuid", &"[redacted]")
+            .field("bearer_token", &"[redacted]")
+            .finish()
+    }
 }
 
 // This could just be a Login/Characters thing, but who knows what else will be
@@ -179,18 +194,7 @@ impl SFAccount {
             )
             .await?;
 
-        #[allow(clippy::indexing_slicing)]
-        let (Some(bearer_token), Some(uuid)) = (
-            val_to_string(&res["token"]["access_token"]),
-            val_to_string(&res["account"]["uuid"]),
-        ) else {
-            return Err(SFError::ParsingError(
-                "missing auth value in api response",
-                format!("{res:?}"),
-            ));
-        };
-
-        self.session = AccountSession { uuid, bearer_token };
+        self.session = parse_account_session(&res)?;
 
         Ok(())
     }
@@ -297,8 +301,11 @@ async fn send_api_request(
     if !res.status().is_success() {
         return Err(SFError::ConnectionError);
     }
-    let text = res.text().await.map_err(|_| SFError::ConnectionError)?;
+    let text = read_response_text(res).await?;
+    parse_api_response(&text)
+}
 
+fn parse_api_response(text: &str) -> Result<Value, SFError> {
     #[derive(Debug, Serialize, Deserialize)]
     struct APIResponse {
         success: bool,
@@ -307,8 +314,12 @@ async fn send_api_request(
         message: Option<Value>,
     }
 
-    let resp: APIResponse = serde_json::from_str(&text)
-        .map_err(|_| SFError::ParsingError("API response", text))?;
+    let resp: APIResponse = serde_json::from_str(text).map_err(|_| {
+        SFError::ParsingError(
+            "API response",
+            format!("invalid envelope ({} bytes)", text.len()),
+        )
+    })?;
 
     if !resp.success {
         return Err(SFError::ConnectionError);
@@ -334,7 +345,9 @@ impl ServerLookup {
     /// Returns `ConnectionError`, if the server could not be reached, ro
     /// `ParsingError`, if the list could not be parsed
     pub async fn fetch() -> Result<ServerLookup, SFError> {
-        Self::fetch_with_client(&reqwest::Client::new()).await
+        let client = reqwest_client(&ConnectionOptions::default())
+            .ok_or(SFError::ConnectionError)?;
+        Self::fetch_with_client(&client).await
     }
 
     /// Fetches the current mapping of server ids to server URLs.
@@ -342,14 +355,15 @@ impl ServerLookup {
     async fn fetch_with_client(
         client: &Client,
     ) -> Result<ServerLookup, SFError> {
-        let res = client
+        let response = client
             .get("https://sfgame.net/config.json")
             .send()
             .await
-            .map_err(|_| SFError::ConnectionError)?
-            .text()
-            .await
             .map_err(|_| SFError::ConnectionError)?;
+        if !response.status().is_success() {
+            return Err(SFError::ConnectionError);
+        }
+        let res = read_response_text(response).await?;
 
         #[derive(Debug, Deserialize, Serialize)]
         struct ServerResp {
@@ -431,13 +445,43 @@ fn val_to_string(val: &Value) -> Option<String> {
     val.as_str().map(std::string::ToString::to_string)
 }
 
-#[derive(Debug)]
+fn parse_account_session(value: &Value) -> Result<AccountSession, SFError> {
+    let bearer_token = value
+        .get("token")
+        .and_then(|token| token.get("access_token"))
+        .and_then(val_to_string);
+    let uuid = value
+        .get("account")
+        .and_then(|account| account.get("uuid"))
+        .and_then(val_to_string);
+    match (bearer_token, uuid) {
+        (Some(bearer_token), Some(uuid)) => {
+            Ok(AccountSession { uuid, bearer_token })
+        }
+        _ => Err(SFError::ParsingError(
+            "missing auth value in api response",
+            "required token/account fields missing".to_string(),
+        )),
+    }
+}
+
 pub struct SSOAuth {
     client: Client,
     options: ConnectionOptions,
     auth_url: Url,
     auth_id: String,
     provider: SSOProvider,
+}
+
+impl std::fmt::Debug for SSOAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SSOAuth")
+            .field("options", &self.options)
+            .field("auth_url", &"[redacted]")
+            .field("auth_id", &"[redacted]")
+            .field("provider", &self.provider)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -514,20 +558,14 @@ impl SSOAuth {
             )
             .await?;
 
-        let access_token = val_to_string(&res["token"]["access_token"])
-            .ok_or(SFError::ConnectionError)?;
-        let uuid = val_to_string(&res["account"]["uuid"])
-            .ok_or(SFError::ConnectionError)?;
+        let session = parse_account_session(&res)?;
         let username = val_to_string(&res["account"]["username"])
             .ok_or(SFError::ConnectionError)?;
 
         Ok(AuthResponse::Success(SFAccount {
             username,
             client: self.client,
-            session: AccountSession {
-                uuid,
-                bearer_token: access_token,
-            },
+            session,
             options: self.options,
             auth: match self.provider {
                 SSOProvider::Google => SSOAuthData::Google,
@@ -581,5 +619,63 @@ impl SSOAuth {
             auth_id,
             provider,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn malformed_auth_responses_do_not_expose_partial_credentials() {
+        let value = json!({
+            "token": {
+                "access_token": "SECRET-ACCESS-TOKEN",
+                "refresh_token": "SECRET-REFRESH-TOKEN",
+            },
+            "account": {},
+        });
+        let error = parse_account_session(&value).unwrap_err();
+        let printed = format!("{error} {error:?}");
+        assert!(!printed.contains("SECRET-ACCESS-TOKEN"));
+        assert!(!printed.contains("SECRET-REFRESH-TOKEN"));
+
+        let envelope = r#"{"token":{"access_token":"SECRET-ACCESS-TOKEN"}}"#;
+        let error = parse_api_response(envelope).unwrap_err();
+        assert!(!format!("{error} {error:?}").contains("SECRET-ACCESS-TOKEN"));
+    }
+
+    #[test]
+    fn valid_auth_envelope_preserves_credentials() {
+        let value = parse_api_response(
+            r#"{
+            "success":true,"status":200,
+            "data":{"token":{"access_token":"token"},"account":{"uuid":"id"}}
+        }"#,
+        )
+        .unwrap();
+        let session = parse_account_session(&value).unwrap();
+        assert_eq!(session.bearer_token, "token");
+        assert_eq!(session.uuid, "id");
+    }
+
+    #[test]
+    fn pending_sso_debug_redacts_handshake_credentials() {
+        let auth = SSOAuth {
+            client: Client::new(),
+            options: ConnectionOptions::default(),
+            auth_url: Url::parse("https://example.com/?token=SECRET-URL")
+                .unwrap(),
+            auth_id: "SECRET-HANDSHAKE-ID".to_string(),
+            provider: SSOProvider::Steam,
+        };
+        let printed = format!("{auth:?}");
+        assert!(!printed.contains("SECRET-HANDSHAKE-ID"));
+        assert!(!printed.contains("SECRET-URL"));
+        assert!(printed.contains("Steam"));
     }
 }

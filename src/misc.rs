@@ -16,6 +16,53 @@ pub const DEFAULT_CRYPTO_ID: &str = "0-00000000000000";
 pub const DEFAULT_SESSION_ID: &str = "00000000000000000000000000000000";
 pub const CRYPTO_IV: &str = "jXT#/vz]3]5X7Jl\\";
 
+/// A string that holds credential material (password hashes, bearer tokens,
+/// session ids) and must never appear in logs, panic messages or `Debug`
+/// output.
+///
+/// `Debug` always prints `[redacted]`. There is deliberately no `Display`
+/// implementation, so accidentally printing a secret with `{}` is a compile
+/// error; use [`Self::get`] at the point where the value is actually needed
+/// (building a request). Serialization is transparent, so storing and
+/// restoring the value (e.g. through `serde`) is unaffected.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+pub struct SecretString(String);
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl SecretString {
+    /// Wraps a secret value
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Gives you the secret value directly. Only use this where it is
+    /// actually required (building a request), never for logging
+    #[must_use]
+    pub fn get(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
 #[must_use]
 pub fn sha1_hash(val: &str) -> String {
     use sha1::{Digest, Sha1};

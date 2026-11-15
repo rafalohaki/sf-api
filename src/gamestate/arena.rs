@@ -283,7 +283,10 @@ impl SingleFight {
         }
 
         if i < values.len() {
-            let trailing = raw.get(i..).unwrap_or(&[]);
+            // `i` is an index into `values`, which already dropped unparsable
+            // `raw` entries; slicing `raw` with it would report the wrong
+            // values. Report the unparsed slice of `values` instead.
+            let trailing = values.get(i..).unwrap_or(&[]);
             warn!(
                 "{} trailing unparsed values in fight.r: {:?}",
                 values.len() - i,

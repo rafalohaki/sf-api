@@ -1101,7 +1101,8 @@ impl ClassData {
             }
             // NOTE: the client metadata provides no combat formulas for
             // `Class.Bert`; mirror Warrior only so `ClassData` can be built.
-            // Such fights are flagged unmodelled via `Class::combat_model_known`
+            // Such fights are flagged unmodelled via
+            // `Class::combat_model_known`
             // / `FightSimulationResult::model_known` — consumers must not trust
             // the win ratio (L1.9:193/196).
             Class::Warrior | Class::Bert => {

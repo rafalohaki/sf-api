@@ -290,6 +290,20 @@ impl Class {
         matches!(self, Self::Paladin | Self::Warrior)
     }
 
+    /// Is this class' equipment model published in the client metadata?
+    ///
+    /// The item rules used by
+    /// [`crate::gamestate::items::Item::can_be_used_by`] /
+    /// `can_be_equipped_by` are known for every class published in the
+    /// metadata. `Bert` has none, so those methods mirror the Warrior result
+    /// as an explicit placeholder ("Bert: unverified, mirrors Warrior").
+    /// Consumers that must not act on placeholder data should check this
+    /// flag first and treat `Bert` answers as "unknown".
+    #[must_use]
+    pub fn equipment_model_known(self) -> bool {
+        !matches!(self, Class::Bert)
+    }
+
     /// Is this class' combat model published in the client metadata?
     ///
     /// Lesson L1.9:193: a class enters the simulator only once its values are

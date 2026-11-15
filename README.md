@@ -120,6 +120,28 @@ please open an issue and describe your use case and I will see what I can do for
 you in terms of opening up the internals like request URLs and session auth for
 you to handle yourself.
 
+## Safety and runtime limits
+
+- Password hashes are replayable credentials, not safe-to-share substitutes
+  for passwords. `SecretString`, session state and known response credential
+  fields redact `Debug` output. Raw response access and serde serialization
+  retain secrets; protect exported data like credentials.
+- Credential fields in `Command::Login`, `SSOLogin` and `Register` use
+  `SecretString`. Convert existing `String` values with `.into()`; the serde
+  representation remains a string.
+- HTTP connections time out after 10 seconds, with a 30-second total request
+  deadline including the response body. Game, SSO and server-list responses
+  have an 8 MiB decoded-body ceiling; larger bodies return `ParsingError`.
+- Fight and raid-floor indices above 4096 return parsing errors before
+  allocating collections. This is a resource ceiling, not a protocol limit.
+  Viewed guilds must fit the wire format's 50 member slots.
+- SSO credential renewal updates the calling character's cached credentials
+  immediately; characters sharing an account reuse an already renewed token.
+- Unverified shop-payment and wheel requests return `InvalidRequest` without
+  being sent. Their wire layouts/enum constants still need independent
+  verification. Bert equipment rules remain unverified; check
+  `Class::equipment_model_known()` before relying on them.
+
 ## Misc.
 
 There are hundreds of properties, that get parsed. This is such a huge amount

@@ -106,6 +106,15 @@ pub struct GameState {
 
 const SHOP_N: usize = 6;
 
+/// Conservative operational parsing ceiling for indexes that are used to size
+/// freshly allocated collections (fight numbers from response headers,
+/// hellevator raid floors from participant lists). The game never legitimately
+/// uses values anywhere near this bound, while a single crafted response with
+/// a larger one would allocate a multi-gigabyte `Vec`. Indexes beyond this
+/// ceiling are rejected with an explicit parsing error instead of being
+/// silently remapped onto a smaller slot.
+const MAX_PARSED_INDEX: usize = 4096;
+
 /// A shop, that you can buy items from
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -420,9 +429,17 @@ impl GameState {
     /// Given a header value like "fight4", this would give you the
     /// corresponding fight[3]. In case that does not exist, it will be created
     /// w/ the default
-    #[must_use]
-    fn get_fight(&mut self, header_name: &str) -> &mut SingleFight {
+    fn get_fight(
+        &mut self,
+        header_name: &str,
+    ) -> Result<&mut SingleFight, SFError> {
         let id = fight_no_from_header(header_name);
+        if id > MAX_PARSED_INDEX {
+            return Err(SFError::ParsingError(
+                "fight number",
+                header_name.to_string(),
+            ));
+        }
         let fights =
             &mut self.last_fight.get_or_insert_with(Default::default).fights;
 
@@ -430,7 +447,7 @@ impl GameState {
             fights.resize(id, SingleFight::default());
         }
         #[allow(clippy::unwrap_used)]
-        fights.get_mut(id - 1).unwrap()
+        Ok(fights.get_mut(id - 1).unwrap())
     }
 
     /// Updates the gamestate with the given key and value
@@ -1402,7 +1419,7 @@ impl GameState {
                     .split_once(|a: char| !a.is_ascii_digit())
                     .map_or(val.as_str(), |a| a.0);
                 if let Ok(winner_id) = raw_winner_id.parse() {
-                    self.get_fight(x).winner_id = winner_id;
+                    self.get_fight(x)?.winner_id = winner_id;
                 } else {
                     error!("Invalid winner id: {raw_winner_id}");
                 }
@@ -1415,7 +1432,7 @@ impl GameState {
                 // Note: The sub_key from this, can improve fighter parsing
             }
             x if x.starts_with("fightheader") => {
-                self.get_fight(x).update_fighters(val.as_str());
+                self.get_fight(x)?.update_fighters(val.as_str());
             }
             "fightgroups" => {
                 let fight =
@@ -1436,7 +1453,7 @@ impl GameState {
                     .get("fightversion")
                     .and_then(|v| v.as_str().parse().ok())
                     .unwrap_or(1);
-                let fight = self.get_fight(x);
+                let fight = self.get_fight(x)?;
                 if let Err(e) = fight.update_rounds(val.as_str(), fight_version)
                 {
                     warn!("Failed to parse fight rounds: {e}");
@@ -1517,6 +1534,12 @@ impl GameState {
                         .and_then(|a| a.parse().ok())
                         .unwrap_or(0);
                     if val > 0 {
+                        if val > MAX_PARSED_INDEX {
+                            return Err(SFError::ParsingError(
+                                "hellevator raid floor",
+                                val.to_string(),
+                            ));
+                        }
                         if val > hellevator.guild_raid_floors.len() {
                             hellevator
                                 .guild_raid_floors
@@ -1551,6 +1574,12 @@ impl GameState {
                         .and_then(|a| a.parse().ok())
                         .unwrap_or(0);
                     if val > 0 {
+                        if val > MAX_PARSED_INDEX {
+                            return Err(SFError::ParsingError(
+                                "hellevator raid floor",
+                                val.to_string(),
+                            ));
+                        }
                         if val > hellevator.guild_raid_floors.len() {
                             hellevator
                                 .guild_raid_floors
@@ -1599,6 +1628,12 @@ impl GameState {
                 let start = data.skip(2, "hellevator_fights")?;
 
                 let floor_count = start.len() / 5;
+                if floor_count > MAX_PARSED_INDEX {
+                    return Err(SFError::ParsingError(
+                        "hellevator raid floor count",
+                        floor_count.to_string(),
+                    ));
+                }
 
                 if floor_count > hellevator.guild_raid_floors.len() {
                     hellevator
@@ -2330,4 +2365,134 @@ pub struct NormalCost {
     pub silver: u64,
     /// The amount of mushrooms something costs
     pub mushrooms: u16,
+}
+
+#[cfg(test)]
+mod resource_ceiling_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn parse_response(body: &str) -> Response {
+        Response::parse(body.to_string(), chrono::Local::now().naive_local())
+            .unwrap()
+    }
+
+    /// Regression: a fight number beyond the [`MAX_PARSED_INDEX`] ceiling
+    /// used to resize the fight list to billions of entries from a single
+    /// crafted response key. It must be rejected without allocating fights.
+    #[test]
+    fn oversized_fight_header_is_rejected() {
+        let mut state = GameState::default();
+        assert!(
+            state
+                .update(parse_response("fightheader4294967297:0"))
+                .is_err()
+        );
+        assert!(state.last_fight.is_none());
+    }
+
+    /// The ceiling itself and valid sparse fight numbers must keep parsing.
+    #[test]
+    fn fight_header_at_ceiling_and_sparse_still_parse() {
+        let mut state = GameState::default();
+        state.update(parse_response("fightheader4096:0")).unwrap();
+        assert_eq!(state.last_fight.unwrap().fights.len(), MAX_PARSED_INDEX);
+
+        let mut state = GameState::default();
+        state.update(parse_response("fightheader5:0")).unwrap();
+        assert_eq!(state.last_fight.unwrap().fights.len(), 5);
+    }
+
+    /// Regression: raid participant floor numbers beyond the
+    /// [`MAX_PARSED_INDEX`] ceiling used to resize the floor list to billions
+    /// of entries from a single crafted response key.
+    #[test]
+    fn oversized_raid_floor_is_rejected() {
+        let mut state = GameState::default();
+        assert!(
+            state
+                .update(parse_response("gtraidparticipants:alice/4294967297"))
+                .is_err()
+        );
+        assert!(
+            state
+                .hellevator
+                .active
+                .as_ref()
+                .unwrap()
+                .guild_raid_floors
+                .is_empty()
+        );
+
+        let mut state = GameState::default();
+        assert!(
+            state
+                .update(parse_response(
+                    "gtraidparticipantsyesterday:bob/4294967297"
+                ))
+                .is_err()
+        );
+        assert!(
+            state
+                .hellevator
+                .active
+                .as_ref()
+                .unwrap()
+                .guild_raid_floors
+                .is_empty()
+        );
+    }
+
+    /// Valid sparse floor numbers still parse and create exactly the slots
+    /// they reference.
+    #[test]
+    fn sparse_raid_floors_still_parse() {
+        let mut state = GameState::default();
+        state
+            .update(parse_response("gtraidparticipants:alice/5"))
+            .unwrap();
+        let floors =
+            &state.hellevator.active.as_ref().unwrap().guild_raid_floors;
+        assert_eq!(floors.len(), 5);
+        assert_eq!(
+            floors.get(4).unwrap().today_assigned,
+            &["alice".to_string()]
+        );
+
+        let mut state = GameState::default();
+        state
+            .update(parse_response("gtraidparticipantsyesterday:bob/3"))
+            .unwrap();
+        let floors =
+            &state.hellevator.active.as_ref().unwrap().guild_raid_floors;
+        assert_eq!(floors.len(), 3);
+        assert_eq!(
+            floors.get(2).unwrap().yesterday_assigned,
+            &["bob".to_string()]
+        );
+    }
+
+    /// The floor count implied by `gtraidfights` is bounded by the same
+    /// ceiling.
+    #[test]
+    fn oversized_gtraidfights_floor_count_is_rejected() {
+        // Two leading timestamps plus 4097 floors of 5 values each.
+        let value = vec!["0"; 2 + 4097 * 5].join("/");
+        let mut state = GameState::default();
+        assert!(
+            state
+                .update(parse_response(&format!("gtraidfights:{value}")))
+                .is_err()
+        );
+        assert!(
+            state
+                .hellevator
+                .active
+                .as_ref()
+                .unwrap()
+                .guild_raid_floors
+                .is_empty()
+        );
+    }
 }

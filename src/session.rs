@@ -15,7 +15,7 @@ use crate::{
     },
     misc::{
         DEFAULT_CRYPTO_ID, DEFAULT_CRYPTO_KEY, DEFAULT_SESSION_ID, HASH_CONST,
-        sha1_hash,
+        SecretString, sha1_hash,
     },
 };
 
@@ -29,12 +29,17 @@ pub struct Session {
     server_url: url::Url,
     /// The id of our session. This will remain the same as long as our login
     /// is valid and nobody else logs in
-    session_id: String,
+    ///
+    /// Stored through [`SecretString`]: possession of a valid session id is
+    /// account access, and the session derives `Debug`.
+    session_id: SecretString,
     /// The amount of commands we have sent
     player_id: u32,
     login_count: u32,
-    crypto_id: String,
-    crypto_key: String,
+    crypto_id: SecretString,
+    /// The key the session uses to encrypt command traffic. Stored through
+    /// [`SecretString`] so `Debug` output cannot leak it.
+    crypto_key: SecretString,
     // We keep this instead of creating a new one, because as per the reqwest
     // docs: "The Client holds a connection pool internally, so it is advised
     // that you create one and reuse it."
@@ -75,19 +80,30 @@ impl std::fmt::Debug for SecretHeaderValue {
 }
 
 impl SecretHeaderValue {
-    fn from_raw(value: HeaderValue) -> Self {
+    fn from_raw(mut value: HeaderValue) -> Self {
+        value.set_sensitive(true);
         Self(value)
     }
 }
 
 /// The password of a character, hashed in the way, that the server expects
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PWHash(String);
 
+/// A password hash is a replayable login credential: the session derives
+/// `Debug` and any `{:?}` of it (logs, panic messages) must not leak it, so
+/// `Debug` prints `[redacted]`. The value itself stays reachable via
+/// [`PWHash::get`].
+impl std::fmt::Debug for PWHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
 impl PWHash {
-    /// Hashes the password the way the server expects it. You can use this to
-    /// store user passwords safely (not in cleartext)
+    /// Hashes the password the way the server expects it. The resulting hash
+    /// is a replayable credential: protect it like the cleartext password.
     #[must_use]
     pub fn new(password: &str) -> Self {
         Self(sha1_hash(&(password.to_string() + HASH_CONST)))
@@ -144,9 +160,9 @@ impl Session {
             login_data: ld,
             server_url: url,
             client,
-            session_id: DEFAULT_SESSION_ID.to_string(),
-            crypto_id: DEFAULT_CRYPTO_ID.to_string(),
-            crypto_key: DEFAULT_CRYPTO_KEY.to_string(),
+            session_id: SecretString::from(DEFAULT_SESSION_ID),
+            crypto_id: SecretString::from(DEFAULT_CRYPTO_ID),
+            crypto_key: SecretString::from(DEFAULT_CRYPTO_KEY),
             login_count: 1,
             options,
             player_id: 0,
@@ -203,7 +219,8 @@ impl Session {
         let value = HeaderValue::from_str(value).map_err(|_| {
             SFError::InvalidRequest("Invalid SSO domain header value")
         })?;
-        self.sso_domain_header = Some((name, SecretHeaderValue::from_raw(value)));
+        self.sso_domain_header =
+            Some((name, SecretHeaderValue::from_raw(value)));
         Ok(())
     }
 
@@ -216,10 +233,10 @@ impl Session {
     /// back to the "not logged in" state. This is basically the equivalent of
     /// clearing browserdata, to logout
     fn logout(&mut self) {
-        self.crypto_key = DEFAULT_CRYPTO_KEY.to_string();
-        self.crypto_id = DEFAULT_CRYPTO_ID.to_string();
+        self.crypto_key = SecretString::from(DEFAULT_CRYPTO_KEY);
+        self.crypto_id = SecretString::from(DEFAULT_CRYPTO_ID);
         self.login_count = 1;
-        self.session_id = DEFAULT_SESSION_ID.to_string();
+        self.session_id = SecretString::from(DEFAULT_SESSION_ID);
         self.player_id = 0;
     }
 
@@ -236,7 +253,7 @@ impl Session {
     /// to make sure, you can make sure here
     #[must_use]
     pub fn has_session_id(&self) -> bool {
-        self.session_id.chars().any(|a| a != '0')
+        self.session_id.get().chars().any(|a| a != '0')
     }
 
     /// Logs in the session by sending a login response to the server and
@@ -252,7 +269,7 @@ impl Session {
         let login_cmd = match self.login_data.clone() {
             LoginData::Basic { username, pw_hash } => Command::Login {
                 username,
-                pw_hash: pw_hash.get().to_string(),
+                pw_hash: SecretString::from(pw_hash.get()),
                 login_count: self.login_count,
             },
             #[cfg(feature = "sso")]
@@ -261,9 +278,9 @@ impl Session {
                 session,
                 ..
             } => Command::SSOLogin {
-                uuid: session.uuid,
+                uuid: SecretString::from(session.uuid),
                 character_id,
-                bearer_token: session.bearer_token,
+                bearer_token: SecretString::from(session.bearer_token),
             },
         };
 
@@ -289,7 +306,7 @@ impl Session {
         let resp = s
             .send_command(&Command::Register {
                 username: username.to_string(),
-                password: password.to_string(),
+                password: SecretString::from(password),
                 gender,
                 race,
                 class,
@@ -300,7 +317,7 @@ impl Session {
             error!("Got no tracking response from server after registering");
             return Err(SFError::ParsingError(
                 "register response",
-                resp.raw_response().to_string(),
+                "missing tracking field".to_string(),
             ));
         };
 
@@ -336,7 +353,6 @@ impl Session {
         command: T,
     ) -> Result<Response, SFError> {
         let command = command.borrow();
-        trace!("Sending a {command:?} command");
 
         let metadata = command.request_metadata();
         if let Some(delay) = metadata.response_delay {
@@ -345,10 +361,16 @@ impl Session {
         }
 
         let old_cmd = command.request_string()?;
-        trace!("Command string: {old_cmd}");
 
         let (cmd_name, cmd_args) =
             old_cmd.split_once(':').unwrap_or((old_cmd.as_str(), ""));
+
+        // Never log the raw command string, the encoded parameters or the
+        // full request URL: all of them contain the (trivially base64
+        // decodable) request parameters — for Login/Register/SSOLogin these
+        // are fully replayable credentials — plus the session id. The
+        // command name alone is enough to follow a trace log.
+        trace!("Command: {cmd_name}");
 
         let parameter_count = if cmd_args.is_empty() {
             0
@@ -370,29 +392,29 @@ impl Session {
 
         let encoded_params =
             base64::engine::general_purpose::URL_SAFE.encode(cmd_args);
-        let url = if metadata.needs_session_id {
-            format!(
-                "{}cmd.php?req={cmd_name}&params={encoded_params}&sid={}",
-                self.server_url, self.crypto_id,
-            )
-        } else {
-            format!(
-                "{}cmd.php?req={cmd_name}&params={encoded_params}",
-                self.server_url,
-            )
-        };
-
-        trace!("Full request url: {url}");
-
-        // Make sure we dont have any weird stuff in our URL
-        url::Url::parse(&url).map_err(|_| {
+        let mut url = self.server_url.join("cmd.php").map_err(|_| {
             SFError::InvalidRequest("Could not parse command url")
         })?;
+        url.set_query(None);
+        url.set_fragment(None);
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("req", cmd_name);
+            query.append_pair("params", &encoded_params);
+            if metadata.needs_session_id {
+                query.append_pair("sid", self.crypto_id.get());
+            }
+        }
+
+        trace!(
+            "Sending {cmd_name} to {} ({parameter_count} parameter(s))",
+            self.server_url.host_str().unwrap_or("[unknown host]")
+        );
 
         #[allow(unused_mut)]
         let mut req = self
             .client
-            .get(&url)
+            .get(url)
             .header(REFERER, &self.server_url.to_string());
 
         #[cfg(feature = "sso")]
@@ -402,9 +424,12 @@ impl Session {
         if self.has_session_id() {
             req = req.header(
                 HeaderName::from_str("PG-Session").unwrap(),
-                HeaderValue::from_str(&self.session_id).map_err(|_| {
-                    SFError::InvalidRequest("Invalid session id")
-                })?,
+                SecretHeaderValue::from_raw(
+                    HeaderValue::from_str(self.session_id.get()).map_err(
+                        |_| SFError::InvalidRequest("Invalid session id"),
+                    )?,
+                )
+                .0,
             );
         }
         req = req.header(
@@ -431,8 +456,7 @@ impl Session {
             return Err(SFError::ConnectionError);
         }
 
-        let response_body =
-            resp.text().await.map_err(|_| SFError::ConnectionError)?;
+        let response_body = read_response_text(resp).await?;
 
         match response_body {
             body if body.is_empty() => Err(SFError::EmptyResponse),
@@ -483,11 +507,18 @@ impl Session {
     pub fn update(&mut self, res: &Response) {
         let data = res.values();
         if let Some(lc) = data.get("login count") {
-            self.login_count = (*lc).into("login count").unwrap_or_default();
+            match (*lc).into("login count") {
+                Ok(count) => self.login_count = count,
+                Err(_) => warn!("Ignoring invalid login count"),
+            }
         }
         if let Some(lc) = data.get("sessionid") {
-            self.session_id.clear();
-            self.session_id.push_str(lc.as_str());
+            let value = lc.as_str();
+            if !value.is_empty() && HeaderValue::from_str(value).is_ok() {
+                self.session_id = SecretString::from(value);
+            } else {
+                warn!("Ignoring invalid session id");
+            }
         }
         if let Some(player_id) = data
             .get("ownplayersave")
@@ -497,8 +528,7 @@ impl Session {
             self.player_id = player_id;
         }
         if let Some(lc) = data.get("cryptoid") {
-            self.crypto_id.clear();
-            self.crypto_id.push_str(lc.as_str());
+            self.crypto_id = SecretString::from(lc.as_str());
         }
     }
 
@@ -558,9 +588,8 @@ impl Session {
 
         if &account.session == session {
             account.refresh_login().await?;
-        } else {
-            *session = account.session.clone();
         }
+        session.clone_from(&account.session);
         Ok(())
     }
 }
@@ -646,7 +675,9 @@ pub(crate) fn reqwest_client(
         HeaderName::from_static(ACCEPT_LANGUAGE.as_str()),
         HeaderValue::from_static("en;q=0.7,en-US;q=0.6"),
     );
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30));
     if let Some(settings) = &options.proxy {
         let mut proxy = Proxy::https(&settings.url).ok()?;
         if let Some(username) = &settings.username {
@@ -659,6 +690,40 @@ pub(crate) fn reqwest_client(
     let ua = options.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);
     builder = builder.user_agent(ua);
     builder.default_headers(headers).build().ok()
+}
+
+// An operational memory ceiling, not a claim about the protocol's maximum.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) async fn read_response_text(
+    mut response: reqwest::Response,
+) -> Result<String, SFError> {
+    let oversized = || {
+        SFError::ParsingError(
+            "response body",
+            "exceeds the 8 MiB limit".to_string(),
+        )
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(oversized());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| SFError::ConnectionError)?
+    {
+        if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+            return Err(oversized());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(body).unwrap_or_else(|error| {
+        String::from_utf8_lossy(error.as_bytes()).into_owned()
+    }))
 }
 
 /// Options, that change the behavior of the communication with the server
@@ -677,11 +742,22 @@ pub struct ConnectionOptions {
     pub error_on_unsupported_version: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxySettings {
     pub url: String,
     pub username: Option<String>,
     pub password: Option<String>,
+}
+
+impl Debug for ProxySettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Proxy URLs can contain credentials in userinfo or query parameters.
+        f.debug_struct("ProxySettings")
+            .field("url", &"[redacted]")
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 static DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -843,5 +919,209 @@ impl SimpleSession {
         }
 
         Ok(self.gamestate.as_mut().unwrap())
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "session")]
+mod secret_redaction_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A password hash is a replayable login credential. The session derives
+    /// `Debug` (and its login data holds the hash), so neither `PWHash` nor
+    /// `Session` may ever print it — and the cleartext password must not
+    /// survive into the session struct at all.
+    #[test]
+    fn session_debug_redacts_login_credentials() {
+        let password = "SUPER-SECRET-PASSWORD";
+        let server =
+            ServerConnection::new("https://sfgame.net").expect("valid url");
+        let session = Session::new("tester", password, server);
+
+        let printed = format!("{session:?}");
+        assert!(!printed.contains(password));
+        assert!(!printed.contains(PWHash::new(password).get()));
+        assert!(printed.contains("[redacted]"));
+
+        // PWHash itself never prints its hash
+        let pw_hash = PWHash::new(password);
+        let pw_debug = format!("{pw_hash:?}");
+        assert!(!pw_debug.contains(pw_hash.get()));
+        assert!(pw_debug.contains("[redacted]"));
+    }
+
+    /// The session id and the crypto key are credentials for the same
+    /// account (possession of either grants command access); their `Debug`
+    /// output is redacted like the login hash.
+    #[test]
+    fn session_debug_redacts_session_credentials() {
+        let server =
+            ServerConnection::new("https://sfgame.net").expect("valid url");
+        let mut session = Session::new("tester", "pw", server);
+        session.session_id = SecretString::from("MY-SESSION-ID");
+        session.crypto_key = SecretString::from("MY-CRYPTO-KEY");
+        session.crypto_id = SecretString::from("MY-CRYPTO-ID");
+
+        let printed = format!("{session:?}");
+        assert!(!printed.contains("MY-SESSION-ID"));
+        assert!(!printed.contains("MY-CRYPTO-KEY"));
+        assert!(!printed.contains("MY-CRYPTO-ID"));
+        assert!(printed.contains("[redacted]"));
+    }
+
+    #[test]
+    fn proxy_debug_redacts_all_credential_locations() {
+        let options = ConnectionOptions {
+            proxy: Some(ProxySettings {
+                url:
+                    "http://URL-USER:URL-PASSWORD@localhost:8080/?key=URL-TOKEN"
+                        .to_string(),
+                username: Some("PROXY-USER".to_string()),
+                password: Some("PROXY-PASSWORD".to_string()),
+            }),
+            ..ConnectionOptions::default()
+        };
+        let printed = format!("{options:?}");
+        for secret in [
+            "URL-USER",
+            "URL-PASSWORD",
+            "URL-TOKEN",
+            "PROXY-USER",
+            "PROXY-PASSWORD",
+        ] {
+            assert!(!printed.contains(secret));
+        }
+    }
+
+    #[test]
+    fn malformed_session_updates_preserve_valid_credentials() {
+        let server = ServerConnection::new("https://sfgame.net").unwrap();
+        let mut session = Session::new("tester", "pw", server);
+        session.session_id = "valid-session".into();
+        session.login_count = 7;
+        for body in [
+            "sessionid:invalid\r\nheader&login count:not-a-number",
+            "sessionid:",
+        ] {
+            let response = Response::parse(
+                body.to_string(),
+                chrono::Local::now().naive_local(),
+            )
+            .unwrap();
+            session.update(&response);
+        }
+        assert_eq!(session.session_id.get(), "valid-session");
+        assert_eq!(session.login_count, 7);
+    }
+
+    async fn http_fixture(
+        response: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let size = stream.read(&mut buffer).await.unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&buffer[..size]);
+            }
+            // Rejection of an oversized body may close the socket early.
+            let _ = stream.write_all(&response).await;
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}/"), task)
+    }
+
+    #[tokio::test]
+    async fn crypto_id_remains_one_query_value() {
+        let (url, request) = http_fixture(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nsuccess:1".to_vec(),
+        )
+        .await;
+        let mut session =
+            Session::new("tester", "pw", ServerConnection::new(&url).unwrap());
+        session.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let crypto_id = "0&params=INJECTED#fragment+value";
+        session.crypto_id = crypto_id.into();
+        session.send_command_raw(Command::Update).await.unwrap();
+        let request = request.await.unwrap();
+        let target = request.split_whitespace().nth(1).unwrap();
+        let request_url =
+            Url::parse(&format!("http://localhost{target}")).unwrap();
+        let pairs: Vec<_> = request_url.query_pairs().collect();
+        assert_eq!(
+            pairs,
+            [
+                ("req".into(), "Poll".into()),
+                ("params".into(), "".into()),
+                ("sid".into(), crypto_id.into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_body_reader_handles_chunked_responses() {
+        let (url, request) = http_fixture(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              9\r\nsuccess:1\r\n0\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let response = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_response_text(response).await.unwrap(), "success:1");
+        request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_body_reader_rejects_declared_and_chunked_overflow() {
+        let oversized_size = MAX_RESPONSE_BYTES + 1;
+        let declared = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {oversized_size}\r\n\r\n"
+        )
+        .into_bytes();
+        let mut chunked = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: \
+             chunked\r\n\r\n{oversized_size:x}\r\n"
+        )
+        .into_bytes();
+        chunked.resize(chunked.len() + oversized_size, b'x');
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        for body in [declared, chunked] {
+            let (url, request) = http_fixture(body).await;
+            let response = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(url)
+                .send()
+                .await
+                .unwrap();
+            assert!(matches!(
+                read_response_text(response).await,
+                Err(SFError::ParsingError("response body", _))
+            ));
+            request.await.unwrap();
+        }
     }
 }

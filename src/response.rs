@@ -42,10 +42,28 @@ impl Clone for Response {
 
 impl Debug for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Debug output is routinely used for logging, so credential values
+        // that arrive in every response body must be redacted here. The raw
+        // values stay available through `values()` and `raw_response()`.
         f.debug_map()
-            .entries(self.values().iter().map(|a| (a.0, a.1.as_str())))
+            .entries(self.values().iter().map(|(key, val)| {
+                let value = if is_credential_key(key) {
+                    "[REDACTED]"
+                } else {
+                    val.as_str()
+                };
+                (*key, value)
+            }))
             .finish()
     }
+}
+
+/// Returns `true` if the response key carries a credential issued during
+/// login, whose value must never be written to logs or debug output.
+fn is_credential_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("sessionid")
+        || key.eq_ignore_ascii_case("cryptoid")
+        || key.eq_ignore_ascii_case("cryptokey")
 }
 
 #[cfg(feature = "serde")]
@@ -104,10 +122,12 @@ impl<'de> serde::Deserialize<'de> for Response {
                     }
                 }
 
-                let body: String =
-                    body.ok_or_else(|| serde::de::Error::missing_field("q"))?;
-                let received_at: NaiveDateTime = received_at
-                    .ok_or_else(|| serde::de::Error::missing_field("j"))?;
+                let body: String = body
+                    .ok_or_else(|| serde::de::Error::missing_field("body"))?;
+                let received_at: NaiveDateTime =
+                    received_at.ok_or_else(|| {
+                        serde::de::Error::missing_field("received_at")
+                    })?;
 
                 Response::parse(body, received_at).map_err(|_| {
                     serde::de::Error::custom("invalid response body")
@@ -199,15 +219,17 @@ impl Response {
         let body = og_body
             .trim_end_matches('|')
             .trim_start_matches(|a: char| !a.is_alphabetic());
-        trace!("Received raw response: {body}");
+        trace!("Received response: {} bytes", body.len());
 
         if !body.contains(':')
             && !body.starts_with("success")
             && !body.starts_with("Success")
         {
+            // The raw body can contain credentials or other sensitive
+            // server data; only report safe context here.
             return Err(SFError::ParsingError(
                 "unexpected server response",
-                body.to_string(),
+                format!("nonstandard response, {} bytes", body.len()),
             ));
         }
 
@@ -233,7 +255,11 @@ impl Response {
                     .filter(|a| !a.is_empty())
                 {
                     let Some((full_key, value)) = part.split_once(':') else {
-                        warn!("weird k/v in resp: {part}");
+                        warn!(
+                            "skipping malformed response part ({} bytes, no \
+                             ':' separator)",
+                            part.len()
+                        );
                         continue;
                     };
 
@@ -259,8 +285,12 @@ impl Response {
                     let old_val =
                         res.insert(key, ResponseVal { value, sub_key });
                     if let Some(old_val) = old_val {
-                        let old = old_val.as_str();
-                        debug!("Overwrote [{key}]: {old} => {value}");
+                        debug!(
+                            "Overwrote duplicate response key [{key}]: {} => \
+                             {} bytes",
+                            old_val.as_str().len(),
+                            value.len()
+                        );
                     }
                 }
                 res
@@ -354,7 +384,7 @@ impl std::fmt::Display for ResponseVal<'_> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::Response;
+    use super::{Response, ResponseVal};
 
     /// FIX-11: the client's message layers are exposed raw, because their wire
     /// semantics were not established statically.
@@ -375,5 +405,57 @@ mod tests {
             Response::parse(body, chrono::Local::now().naive_local()).unwrap();
         assert_eq!(resp.messages_raw(), None);
         assert!(!resp.has_message_layer());
+    }
+
+    /// Debug output must not leak the credential values that arrive in
+    /// every response body, while the raw accessors still return them for
+    /// real consumers.
+    #[test]
+    fn test_debug_redacts_credentials_but_raw_access_works() {
+        let body = "success:1&sessionid:sekret-session-id&cryptoid:\
+                    sekret-crypto-id&cryptokey:sekret-crypto-key&login count:5"
+            .to_string();
+        let resp =
+            Response::parse(body, chrono::Local::now().naive_local()).unwrap();
+
+        let debug_output = format!("{resp:?}");
+        assert!(!debug_output.contains("sekret-session-id"));
+        assert!(!debug_output.contains("sekret-crypto-id"));
+        assert!(!debug_output.contains("sekret-crypto-key"));
+        assert!(debug_output.contains("[REDACTED]"));
+        // Non-credential fields stay useful for debugging.
+        assert!(debug_output.contains("login count"));
+
+        assert_eq!(
+            resp.values().get("sessionid").map(ResponseVal::as_str),
+            Some("sekret-session-id")
+        );
+        assert_eq!(
+            resp.values().get("cryptoid").map(ResponseVal::as_str),
+            Some("sekret-crypto-id")
+        );
+        assert_eq!(
+            resp.values().get("cryptokey").map(ResponseVal::as_str),
+            Some("sekret-crypto-key")
+        );
+    }
+
+    /// The parsing error for nonstandard responses must not include the
+    /// raw body, which can carry credentials or other sensitive text.
+    #[test]
+    fn test_malformed_response_error_hides_body() {
+        let secret = "TOP-SECRET-BODY-CONTENT";
+        let body = format!("nonsense without any separators {secret}");
+        let error =
+            Response::parse(body.clone(), chrono::Local::now().naive_local())
+                .unwrap_err();
+
+        let message = error.to_string();
+        assert!(!message.contains(secret));
+        assert!(!message.contains(&body));
+        assert!(
+            message.contains(&format!("{} bytes", body.len())),
+            "error should carry safe context: {message}"
+        );
     }
 }

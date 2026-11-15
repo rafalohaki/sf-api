@@ -25,6 +25,7 @@ use crate::{
         underworld::*,
         unlockables::*,
     },
+    misc::SecretString,
 };
 
 /// Per-request metadata, that the official client keeps on its `ARequest`
@@ -96,7 +97,11 @@ pub enum Command {
         /// The username of the player you are trying to login
         username: String,
         /// The sha1 hashed password of the player
-        pw_hash: String,
+        ///
+        /// **Secret**: a replayable login credential. Stored through
+        /// [`SecretString`] so `Debug` (printed by
+        /// `trace!("Sending a {command:?}")`) cannot leak it.
+        pw_hash: SecretString,
         /// Honestly, I am not 100% sure what this is anymore, but it is
         /// related to the amount of times you have logged in. Might be useful
         /// for logging in again after error
@@ -104,17 +109,22 @@ pub enum Command {
     },
     /// Manually sends a login request to the server.
     /// **WARN:** The behavior for a credentials mismatch, with the
-    /// credentials in the user is undefined. Use the login method instead for
+    /// credentials in the user is undefined. Use a login method instead for
     /// a safer abstraction
     #[cfg(feature = "sso")]
     #[deprecated = "Use a login method instead"]
     SSOLogin {
         /// Identifies the S&F account, that has this character
-        uuid: String,
+        ///
+        /// **Secret**: together with the bearer token this identifies and
+        /// authenticates the account. Redacted from `Debug`.
+        uuid: SecretString,
         /// Identifies the specific character an account has
         character_id: String,
         /// The thing to authenticate with
-        bearer_token: String,
+        ///
+        /// **Secret**: a usable login credential. Redacted from `Debug`.
+        bearer_token: SecretString,
     },
     /// Registers a new normal character in the server. I am not sure about the
     /// portrait, so currently this sets the same default portrait for every
@@ -124,7 +134,10 @@ pub enum Command {
         /// The username of the new account
         username: String,
         /// The password of the new account
-        password: String,
+        ///
+        /// **Secret**: the account password in cleartext. Stored through
+        /// [`SecretString`] so `Debug` cannot leak it.
+        password: SecretString,
         /// The gender of the new character
         gender: Gender,
         /// The race of the new character
@@ -589,6 +602,17 @@ pub enum Command {
     /// `WheelOfFortune:{payment}` for spinning. It uses
     /// [`Command::WheelOfFortuneSpin`] instead. This variant is kept so that
     /// existing code keeps compiling.
+    ///
+    /// **WIRE COLLISION:** on a 32.0 server the request name
+    /// `WheelOfFortune:{n}` means the state query with `WheelTurnType`
+    /// semantics (`None=0/UseMushroom=1/UseToken=2/...`), while this variant
+    /// used to emit `FortunePayment` numbers
+    /// (`LuckyCoins=0/Mushrooms=1/FreeTurn=2`). A legacy `LuckyCoins` spin
+    /// would therefore silently become a "no turn type" query. The wire
+    /// string of this variant is rerouted onto
+    /// [`Command::WheelOfFortuneSpin`] to remove the collision; like the spin
+    /// request it is gated (refused) until the enum numberings are verified.
+    #[deprecated(note = "32.0: use WheelOfFortuneSpin")]
     SpinWheelOfFortune {
         /// The resource you want to spend to spin the wheel
         payment: FortunePayment,
@@ -1363,9 +1387,10 @@ pub enum FortunePayment {
 /// Maps a legacy [`FortunePayment`] onto the client-32.0 [`WheelTurnType`].
 ///
 /// The pre-32.0 request carried the payment as a single number; 32.0 sends a
-/// dedicated turn type instead. `LuckyCoins` becomes [`WheelTurnType::UseToken`]
-/// because lucky coins *are* the wheel tokens, `Mushrooms` becomes
-/// [`WheelTurnType::UseMushroom`] and `FreeTurn` stays [`WheelTurnType::Free`].
+/// dedicated turn type instead. `LuckyCoins` becomes
+/// [`WheelTurnType::UseToken`] because lucky coins *are* the wheel tokens,
+/// `Mushrooms` becomes [`WheelTurnType::UseMushroom`] and `FreeTurn` stays
+/// [`WheelTurnType::Free`].
 ///
 /// Lossy in one direction only: [`WheelTurnType::None`], `VideoAd` and
 /// `Subscription` have no legacy equivalent — see
@@ -1389,7 +1414,9 @@ impl FortunePayment {
             WheelTurnType::UseToken => Some(Self::LuckyCoins),
             WheelTurnType::UseMushroom => Some(Self::Mushrooms),
             WheelTurnType::Free => Some(Self::FreeTurn),
-            WheelTurnType::None | WheelTurnType::VideoAd | WheelTurnType::Subscription => None,
+            WheelTurnType::None
+            | WheelTurnType::VideoAd
+            | WheelTurnType::Subscription => None,
         }
     }
 }
@@ -1537,16 +1564,43 @@ impl Command {
         // `/`-separated parameter list. Neither an escape mechanism nor the
         // exact wire layout was recoverable from static metadata, and a
         // standard-base64 signature contains `/`, which would shift every
-        // parameter after it on the server. Until the format is verified
-        // against a live server (or IL), refuse to send instead of gambling
-        // with a payment request. See `gamestate/shop.rs` and
-        // `docs/re/sf-client-protocol.md` §4.
+        // parameter after it on the server. `ShopPreCheckout` belongs to the
+        // same unverified `/`-separated payment layer (and is a step in the
+        // purchase flow), so it is gated like `ShopInit`/`ShopCheckout`.
+        // Until the format is verified against a live server (or IL), refuse
+        // to send instead of gambling with a payment request. See
+        // `gamestate/shop.rs` and `docs/re/sf-client-protocol.md` §4.
         if matches!(
             self,
-            Command::ShopCheckout { .. } | Command::ShopInit { .. }
+            Command::ShopCheckout { .. }
+                | Command::ShopInit { .. }
+                | Command::ShopPreCheckout { .. }
         ) {
             return Err(SFError::InvalidRequest(
-                "shop payment request wire format is unverified; refusing to send until confirmed against a live server",
+                "shop payment request wire format is unverified; refusing to \
+                 send until confirmed against a live server",
+            ));
+        }
+
+        // Wheel safety gate: the `WheelType` (`gamestate/rewards.rs`) and
+        // `WheelTurnType` numberings are declaration-order conventions that
+        // were never verified against the compiled client constants (see
+        // their doc comments). `WheelOfFortuneSpin` spends resources
+        // (mushrooms/tokens), and `WheelOfFortune:{n}` is the 32.0 state
+        // query — an off-by-one in either enum silently pays with the wrong
+        // currency or queries the wrong wheel. Until the numbering is
+        // confirmed against a live server or IL, refuse to send. The
+        // deprecated `SpinWheelOfFortune` is rerouted onto the same spin
+        // request and is therefore gated with it.
+        if matches!(
+            self,
+            Command::SpinWheelOfFortune { .. }
+                | Command::WheelOfFortune { .. }
+                | Command::WheelOfFortuneSpin { .. }
+        ) {
+            return Err(SFError::InvalidRequest(
+                "wheel request enum numbering is unverified; refusing to send \
+                 until confirmed against a live server",
             ));
         }
 
@@ -1562,7 +1616,8 @@ impl Command {
                 pw_hash,
                 login_count,
             } => {
-                let full_hash = sha1_hash(&format!("{pw_hash}{login_count}"));
+                let full_hash =
+                    sha1_hash(&format!("{}{login_count}", pw_hash.get()));
                 format!(
                     "AccountLogin:{username}/{full_hash}/{login_count}/\
                      unity3d_webglplayer//{APP_VERSION}///0/"
@@ -1572,8 +1627,9 @@ impl Command {
             Command::SSOLogin {
                 uuid, character_id, ..
             } => format!(
-                "SFAccountCharLogin:{uuid}/{character_id}/unity3d_webglplayer/\
-                 /{APP_VERSION}"
+                "SFAccountCharLogin:{}/{}/unity3d_webglplayer//{APP_VERSION}",
+                uuid.get(),
+                character_id
             ),
             Command::Register {
                 username,
@@ -1584,8 +1640,9 @@ impl Command {
             } => {
                 // TODO: Custom portrait
                 format!(
-                    "AccountCreate:{username}/{password}/{username}@playa.sso/\
-                     {}/{}/{}/8,203,201,6,199,3,1,2,1/0//en",
+                    "AccountCreate:{username}/{}/{username}@playa.sso/{}/{}/\
+                     {}/8,203,201,6,199,3,1,2,1/0//en",
+                    password.get(),
                     *gender as usize + 1,
                     *race as usize,
                     *class as usize + 1
@@ -1837,7 +1894,18 @@ impl Command {
             Command::SpinWheelOfFortune {
                 payment: fortune_payment,
             } => {
-                format!("WheelOfFortune:{}", *fortune_payment as usize)
+                // WIRE COLLISION (see the variant docs): the pre-32.0 request
+                // emitted `WheelOfFortune:{payment}`, which on a 32.0 server
+                // collides with the state query (WheelTurnType numbering) — a
+                // legacy `LuckyCoins` spin (`0`) would silently become a
+                // "no turn type" query. Reroute legacy spins onto the 32.0
+                // spin request (`From<FortunePayment> for WheelTurnType`
+                // maps LuckyCoins → UseToken etc.). Currently unreachable
+                // because of the wheel gate above.
+                Self::wheel_spin_wire_string(
+                    WheelType::Basic,
+                    (*fortune_payment).into(),
+                )
             }
             // The 32.0 client splits the old wheel request into
             // WheelOfFortune / WheelOfFortuneEnter / WheelOfFortuneSpin. The
@@ -1857,12 +1925,7 @@ impl Command {
             Command::WheelOfFortuneSpin {
                 wheel_type,
                 turn_type,
-            } => {
-                format!(
-                    "WheelOfFortuneSpin:{}/{}",
-                    *wheel_type as usize, *turn_type as usize
-                )
-            }
+            } => Self::wheel_spin_wire_string(*wheel_type, *turn_type),
             Command::FortressGather { resource } => {
                 format!("FortressGather:{}", *resource as usize + 1)
             }
@@ -2462,6 +2525,23 @@ impl Command {
             }
         })
     }
+
+    /// The wire string of the client-32.0 spin request
+    /// (`WheelOfFortuneSpin:{wheel_type}/{turn_type}`), following the
+    /// crate-wide `Name:number[/number]` convention. The enum numberings
+    /// themselves are unverified — see the wheel gate in
+    /// [`Self::request_string`]. Exposed for tests, which cannot reach the
+    /// gated `request_string` arms.
+    #[cfg(feature = "session")]
+    pub(crate) fn wheel_spin_wire_string(
+        wheel_type: WheelType,
+        turn_type: WheelTurnType,
+    ) -> String {
+        format!(
+            "WheelOfFortuneSpin:{}/{}",
+            wheel_type as usize, turn_type as usize
+        )
+    }
 }
 
 macro_rules! generate_flag_enum {
@@ -2646,7 +2726,8 @@ mod tests {
     /// The class dungeons ("Class World", level 250+) reuse the light dungeon
     /// wire command with the raw game id. Wire format verified against the
     /// Mercy fork decompile:
-    /// `FightClassDungeon { index, use_mushroom }` -> `PlayerDungeonBattle:{index}/{use_mushroom}`
+    /// `FightClassDungeon { index, use_mushroom }` ->
+    /// `PlayerDungeonBattle:{index}/{use_mushroom}`
     #[test]
     fn test_fight_class_dungeon_serialization() {
         let cmd = Command::FightClassDungeon {
@@ -2700,25 +2781,48 @@ mod tests {
     }
 
     /// FIX-1: the three 32.0 wheel requests. The exact client `ToString`
-    /// layout is unverified, so these tests pin the crate-wide
-    /// `Name:number[/number]` convention only.
+    /// layout is unverified and — more importantly — the `WheelType` /
+    /// `WheelTurnType` numberings are declaration-order conventions only
+    /// (never verified against the compiled client constants). The spin
+    /// spends resources (mushrooms/tokens) and `WheelOfFortune:{n}` is the
+    /// 32.0 state query, so the resource-charging requests are gated (refuse)
+    /// until the numbering is verified against a live server or IL. Only
+    /// `WheelOfFortuneEnter` (a bool-only screen request, no payment) stays
+    /// sendable and pins the name convention.
     #[test]
     fn test_wheel_of_fortune_32_0_requests() {
-        let cmd = Command::WheelOfFortune {
+        use crate::error::SFError;
+
+        let refused = |err: SFError, what: &str| {
+            assert!(
+                matches!(err, SFError::InvalidRequest(m) if m.contains("unverified")),
+                "{what} must refuse until the enum numbering is verified, \
+                 got: {err:?}"
+            );
+        };
+
+        let spin = Command::WheelOfFortuneSpin {
+            wheel_type: WheelType::BasicPlus,
+            turn_type: WheelTurnType::Free,
+        };
+        refused(spin.request_string().unwrap_err(), "WheelOfFortuneSpin");
+
+        let query = Command::WheelOfFortune {
             turn_type: WheelTurnType::UseMushroom,
         };
-        assert_eq!(cmd.request_string().unwrap(), "WheelOfFortune:1");
+        refused(query.request_string().unwrap_err(), "WheelOfFortune");
+
+        // The deprecated legacy spin is rerouted onto the spin request and
+        // therefore gated as well.
+        let legacy = Command::SpinWheelOfFortune {
+            payment: FortunePayment::LuckyCoins,
+        };
+        refused(legacy.request_string().unwrap_err(), "SpinWheelOfFortune");
 
         let cmd = Command::WheelOfFortuneEnter {
             send_config_response: true,
         };
         assert_eq!(cmd.request_string().unwrap(), "WheelOfFortuneEnter:1");
-
-        let cmd = Command::WheelOfFortuneSpin {
-            wheel_type: WheelType::BasicPlus,
-            turn_type: WheelTurnType::Free,
-        };
-        assert_eq!(cmd.request_string().unwrap(), "WheelOfFortuneSpin:1/4");
     }
 
     /// FIX-3, FIX-4, FIX-5 and FIX-7: request names that differ from the
@@ -2766,10 +2870,10 @@ mod tests {
         };
         assert_eq!(cmd.request_string().unwrap(), "GetShopCatalog:3/1");
 
-        // Payment-safety gate: ShopInit/ShopCheckout refuse to build a wire
-        // string until the `/`-separated format is verified against a live
-        // server (a standard-base64 signature contains `/`). See
-        // `review_fix_tests` and `gamestate/shop.rs`.
+        // Payment-safety gate: ShopInit/ShopCheckout/ShopPreCheckout refuse to
+        // build a wire string until the `/`-separated format is verified
+        // against a live server (a standard-base64 signature contains `/`).
+        // See `review_fix_tests` and `gamestate/shop.rs`.
         let cmd = Command::ShopInit {
             request: ShopInitRequest {
                 platform: AppStore::Android,
@@ -2787,7 +2891,10 @@ mod tests {
         let cmd = Command::ShopPreCheckout {
             arguments: vec!["1".to_string(), "product".to_string()],
         };
-        assert_eq!(cmd.request_string().unwrap(), "ShopPreCheckout:1/product");
+        assert!(
+            cmd.request_string().is_err(),
+            "unverified payment wire must refuse (ShopPreCheckout)"
+        );
 
         assert_eq!(
             Command::SFHomeLink.request_string().unwrap(),
@@ -2876,12 +2983,16 @@ mod review_fix_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::Command;
-    use crate::error::SFError;
-    use crate::gamestate::shop::{AppStore, ShopCheckoutRequest, ShopInitRequest};
+    use crate::{
+        error::SFError,
+        gamestate::shop::{AppStore, ShopCheckoutRequest, ShopInitRequest},
+    };
 
     /// The payment requests must refuse to go on the wire until the exact
     /// `/`-separated format is verified against a live server: a standard
     /// base64 signature contains `/` and would shift every later parameter.
+    /// `ShopPreCheckout` belongs to the same `/`-separated payment layer and
+    /// is gated with them.
     #[test]
     fn shop_payment_requests_refuse_unverified_wire() {
         let init = Command::ShopInit {
@@ -2906,7 +3017,10 @@ mod review_fix_tests {
                 ios_storefront_location: String::new(),
             },
         };
-        for cmd in [init, checkout] {
+        let pre_checkout = Command::ShopPreCheckout {
+            arguments: vec!["1".into(), "p".into(), "abc+/==".into()],
+        };
+        for cmd in [init, checkout, pre_checkout] {
             let err = cmd
                 .request_string()
                 .expect_err("unverified payment wire must refuse");
@@ -2915,6 +3029,73 @@ mod review_fix_tests {
                 "wrong refusal: {err:?}"
             );
         }
+    }
+
+    /// The `WheelType`/`WheelTurnType` numberings are declaration-order
+    /// conventions only (never verified against the compiled client
+    /// constants). The spin spends resources and `WheelOfFortune:{n}` is the
+    /// state query, so both must refuse until the numbering is verified.
+    #[test]
+    fn wheel_requests_refuse_unverified_wire() {
+        use super::{FortunePayment, WheelTurnType};
+        use crate::gamestate::rewards::WheelType;
+
+        let spin = Command::WheelOfFortuneSpin {
+            wheel_type: WheelType::Basic,
+            turn_type: WheelTurnType::UseToken,
+        };
+        let query = Command::WheelOfFortune {
+            turn_type: WheelTurnType::UseMushroom,
+        };
+        let legacy = Command::SpinWheelOfFortune {
+            payment: FortunePayment::Mushrooms,
+        };
+        for (cmd, what) in [
+            (spin, "WheelOfFortuneSpin"),
+            (query, "WheelOfFortune"),
+            (legacy, "SpinWheelOfFortune"),
+        ] {
+            let err = cmd.request_string();
+            assert!(
+                matches!(err, Err(SFError::InvalidRequest(msg)) if msg.contains("unverified")),
+                "{what} must refuse until the numbering is verified, got: \
+                 {err:?}"
+            );
+        }
+    }
+
+    /// The legacy spin must not collide with the 32.0 state query any more:
+    /// pre-fix it emitted `WheelOfFortune:{payment}`, which on a 32.0 server
+    /// means a state query with `WheelTurnType` semantics. It is rerouted
+    /// onto `WheelOfFortuneSpin:{wheel_type}/{turn_type}` via
+    /// `From<FortunePayment> for WheelTurnType`.
+    #[test]
+    fn legacy_wheel_spin_is_rerouted_not_colliding() {
+        use super::{FortunePayment, WheelTurnType};
+        use crate::gamestate::rewards::WheelType;
+
+        // Mapping semantics: LuckyCoins are the wheel tokens.
+        assert_eq!(
+            WheelTurnType::from(FortunePayment::LuckyCoins),
+            WheelTurnType::UseToken
+        );
+        assert_eq!(
+            WheelTurnType::from(FortunePayment::Mushrooms),
+            WheelTurnType::UseMushroom
+        );
+        assert_eq!(
+            WheelTurnType::from(FortunePayment::FreeTurn),
+            WheelTurnType::Free
+        );
+
+        let wire = Command::wheel_spin_wire_string(
+            WheelType::Basic,
+            FortunePayment::LuckyCoins.into(),
+        );
+        assert_eq!(wire, "WheelOfFortuneSpin:0/2");
+        // The spin request name no longer equals the `WheelOfFortune:{n}`
+        // state query the legacy variant used to emit (`WheelOfFortune:0`).
+        assert!(!wire.starts_with("WheelOfFortune:"));
     }
 
     /// A payment signature is a usable credential: `{:?}` of the command must
@@ -2938,5 +3119,69 @@ mod review_fix_tests {
         assert!(!printed.contains("SUPER-SECRET-SIGNATURE"));
         assert!(!printed.contains("TX-000"));
         assert!(printed.contains("[redacted]"));
+    }
+
+    /// Login/Register commands carry replayable login credentials (the raw
+    /// login string is fully reconstructable from them). `{:?}` of the
+    /// command — printed by `trace!("Sending a {command:?}")` — must never
+    /// contain them.
+    #[test]
+    fn login_register_command_debug_redacts_credentials() {
+        use crate::gamestate::character::{Class, Gender, Race};
+
+        let login = Command::Login {
+            username: "tester".into(),
+            pw_hash: "SECRET-LOGIN-HASH".into(),
+            login_count: 5,
+        };
+        let printed = format!("{login:?}");
+        assert!(!printed.contains("SECRET-LOGIN-HASH"));
+        assert!(printed.contains("[redacted]"));
+
+        let register = Command::Register {
+            username: "tester".into(),
+            password: "PLAINTEXT-PASSWORD".into(),
+            gender: Gender::Female,
+            race: Race::Human,
+            class: Class::Warrior,
+        };
+        let printed = format!("{register:?}");
+        assert!(!printed.contains("PLAINTEXT-PASSWORD"));
+        assert!(printed.contains("[redacted]"));
+    }
+
+    /// The SSO login carries a usable bearer token and the account uuid; both
+    /// must be redacted from `Debug`.
+    #[cfg(feature = "sso")]
+    #[test]
+    fn sso_login_command_debug_redacts_credentials() {
+        let cmd = Command::SSOLogin {
+            uuid: "SECRET-ACCOUNT-UUID".into(),
+            character_id: "42".into(),
+            bearer_token: "SECRET-BEARER-TOKEN".into(),
+        };
+        let printed = format!("{cmd:?}");
+        assert!(!printed.contains("SECRET-BEARER-TOKEN"));
+        assert!(!printed.contains("SECRET-ACCOUNT-UUID"));
+        assert!(printed.contains("42"), "character_id is not a secret");
+        assert!(printed.contains("[redacted]"));
+    }
+
+    /// The secret wrappers stay transparent under serde: commands keep
+    /// round-tripping through JSON unchanged, while `Debug` remains redacted.
+    #[cfg(feature = "sso")]
+    #[test]
+    fn login_command_serde_roundtrip_preserves_secrets() {
+        let login = Command::Login {
+            username: "tester".into(),
+            pw_hash: "SECRET-LOGIN-HASH".into(),
+            login_count: 5,
+        };
+        let json = serde_json::to_string(&login).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(login, back);
+
+        // Data export stays a plain string; only Debug output is redacted.
+        assert!(json.contains("SECRET-LOGIN-HASH"));
     }
 }

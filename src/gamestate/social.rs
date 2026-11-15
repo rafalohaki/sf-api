@@ -743,6 +743,14 @@ impl NewsEntry {
     }
 }
 
+/// The `othergroup` wire format has fixed slots for exactly this many guild
+/// members (levels at `64 + i`, last activity at `114 + i`, treasure levels at
+/// `214 + i`, instructor levels at `264 + i`, ranks at `314 + i` and pet
+/// levels at `390 + i`). A larger member count cannot be mapped onto real
+/// slots and is rejected during parsing instead of silently producing garbage
+/// members.
+const MAX_GUILD_MEMBERS: i64 = 50;
+
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OtherGuild {
@@ -784,7 +792,14 @@ impl OtherGuild {
             .map(|c| c.trim().parse::<i64>().unwrap_or_default())
             .collect();
 
-        self.member_count = data.csiget(3, "member count", 0)?;
+        let raw_member_count: i64 = data.csiget(3, "member count", 0)?;
+        if !(0..=MAX_GUILD_MEMBERS).contains(&raw_member_count) {
+            return Err(SFError::ParsingError(
+                "member count",
+                raw_member_count.to_string(),
+            ));
+        }
+        self.member_count = soft_into(raw_member_count, "member count", 0);
         let member_count = self.member_count as usize;
         self.finished_raids = data.csiget(8, "raid count", 0)?;
         self.honor = data.csiget(13, "other guild honor", 0)?;
@@ -857,4 +872,65 @@ pub enum ClaimableMailType {
 pub struct ClaimablePreview {
     pub items: Vec<Item>,
     pub resources: Vec<Reward>,
+}
+
+#[cfg(test)]
+mod guild_member_ceiling_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::{gamestate::GameState, response::Response};
+
+    fn parse_response(body: &str) -> Response {
+        Response::parse(body.to_string(), chrono::Local::now().naive_local())
+            .unwrap()
+    }
+
+    /// Regression: the guild wire layout has fixed slots for exactly
+    /// [`MAX_GUILD_MEMBERS`] members, but a member count from the response
+    /// used to size `members` unchecked. Anything outside the layout must be
+    /// rejected with an explicit parsing error.
+    #[test]
+    fn oversized_member_count_is_rejected() {
+        // Beyond the 50-slot layout, but small enough that it previously
+        // survived the u8 field conversion unchecked.
+        let mut state = GameState::default();
+        assert!(
+            state
+                .update(parse_response("othergroup:0/0/0/200"))
+                .is_err()
+        );
+
+        // Multi-billion counts must be rejected before any conversion, too.
+        let mut state = GameState::default();
+        assert!(
+            state
+                .update(parse_response("othergroup:0/0/0/4294967297"))
+                .is_err()
+        );
+    }
+
+    /// A valid member count still parses and fills the sparse member slots.
+    #[test]
+    fn valid_member_count_parses_layout() {
+        let mut data = vec![0i64; 400];
+        data[3] = 2;
+        data[64] = 42;
+        data[65] = 43;
+        let body = format!(
+            "othergroupname:TestGuild&othergroup:{}",
+            data.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+
+        let mut state = GameState::default();
+        state.update(parse_response(&body)).unwrap();
+
+        let guild = state.lookup.guilds.get("TestGuild").unwrap();
+        assert_eq!(guild.member_count, 2);
+        assert_eq!(guild.members.len(), 2);
+        assert_eq!(guild.members.get(0).unwrap().level, 42);
+        assert_eq!(guild.members.get(1).unwrap().level, 43);
+    }
 }

@@ -649,6 +649,11 @@ impl Item {
     ///
     /// Returns `true` if the item itself is equipment and this class has the
     /// ability to wear it
+    ///
+    /// **Placeholder:** [`Class::Bert`] is unverified — the client metadata
+    /// contains no equipment rules for it, so this method reports Warrior's
+    /// rules ("Bert: unverified, mirrors Warrior"). Check
+    /// [`Class::equipment_model_known`] before relying on the answer.
     #[must_use]
     pub fn can_be_equipped_by(&self, class: Class) -> bool {
         self.typ.equipment_slot().is_some() && self.can_be_used_by(class)
@@ -659,6 +664,11 @@ impl Item {
     ///
     /// Returns `true` if the item does not have a class requirement, or if the
     /// class requirement matches the given class.
+    ///
+    /// **Placeholder:** [`Class::Bert`] is unverified — the client metadata
+    /// contains no equipment rules for it, so this method reports Warrior's
+    /// rules ("Bert: unverified, mirrors Warrior"). Check
+    /// [`Class::equipment_model_known`] before relying on the answer.
     #[must_use]
     #[allow(clippy::enum_glob_use, clippy::match_same_arms)]
     pub fn can_be_used_by(&self, class: Class) -> bool {
@@ -743,11 +753,12 @@ impl Item {
                         else {
                             continue;
                         };
-                        *attributes.get_mut(atr_typ) += atr_val;
+                        let atr = attributes.get_mut(atr_typ);
+                        *atr = atr.saturating_add(atr_val);
                     }
                     6 => {
                         for atr in attributes.values_mut() {
-                            *atr += atr_val;
+                            *atr = atr.saturating_add(atr_val);
                         }
                     }
                     21 => {
@@ -756,7 +767,8 @@ impl Item {
                             AttributeType::Constitution,
                             AttributeType::Luck,
                         ] {
-                            *attributes.get_mut(atr) += atr_val;
+                            let slot = attributes.get_mut(atr);
+                            *slot = slot.saturating_add(atr_val);
                         }
                     }
                     22 => {
@@ -765,7 +777,8 @@ impl Item {
                             AttributeType::Constitution,
                             AttributeType::Luck,
                         ] {
-                            *attributes.get_mut(atr) += atr_val;
+                            let slot = attributes.get_mut(atr);
+                            *slot = slot.saturating_add(atr_val);
                         }
                     }
                     23 => {
@@ -774,7 +787,8 @@ impl Item {
                             AttributeType::Constitution,
                             AttributeType::Luck,
                         ] {
-                            *attributes.get_mut(atr) += atr_val;
+                            let slot = attributes.get_mut(atr);
+                            *slot = slot.saturating_add(atr_val);
                         }
                     }
                     rune_typ => {
@@ -1465,4 +1479,105 @@ pub(crate) fn parse_active_potions(
             // 6 => effect, but no idea why we would want to use that
         })
     })
+}
+
+#[cfg(test)]
+mod equipment_model_tests {
+    use crate::gamestate::character::Class;
+
+    /// Bert has no equipment rules in the client metadata:
+    /// `can_be_used_by`/`can_be_equipped_by` mirror Warrior for it as an
+    /// explicit placeholder. The uncertainty must be observable through
+    /// `Class::equipment_model_known` instead of only living in a code
+    /// comment.
+    #[test]
+    fn bert_equipment_model_is_marked_unknown() {
+        assert!(!Class::Bert.equipment_model_known());
+
+        // Every class with published rules reports them as known.
+        assert!(Class::Warrior.equipment_model_known());
+        assert!(Class::Berserker.equipment_model_known());
+        assert!(Class::DemonHunter.equipment_model_known());
+    }
+}
+
+#[cfg(test)]
+mod item_attribute_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Parses a breast plate with the given (attribute type, value) blocks.
+    fn parse_item(blocks: [(i64, i64); 3]) -> Item {
+        let mut data = vec![0i64; ITEM_PARSE_LEN];
+        data[0] = 3; // BreastPlate
+        data[3] = 1000; // model id 0
+        for (i, (typ, val)) in blocks.iter().enumerate() {
+            data[7 + i] = *typ;
+            data[10 + i] = *val;
+        }
+        Item::parse(&data, ServerTime::default()).unwrap().unwrap()
+    }
+
+    /// Regression: attribute bonuses are attacker-supplied u32 values and the
+    /// wire allows repeated blocks, so adding them must saturate instead of
+    /// overflowing (which panicked in debug builds). Covers the single and
+    /// the all-attributes additions.
+    #[test]
+    fn all_attributes_block_saturates() {
+        let item = parse_item([
+            (6, 3_000_000_000),
+            (6, 3_000_000_000),
+            (1, 3_000_000_000),
+        ]);
+        for atr in item.attributes.values() {
+            assert_eq!(*atr, u32::MAX);
+        }
+    }
+
+    /// The triple attribute additions (types 21/22/23) must saturate too.
+    #[test]
+    fn triple_attribute_blocks_saturate() {
+        // Strength/Dexterity + Constitution/Luck on top of a full
+        // "all attributes" bonus overflows every targeted attribute.
+        let item = parse_item([
+            (6, 3_000_000_000),
+            (21, 3_000_000_000),
+            (22, 3_000_000_000),
+        ]);
+        assert_eq!(
+            item.attributes.get(AttributeType::Intelligence),
+            &3_000_000_000
+        );
+        for atr in [
+            AttributeType::Strength,
+            AttributeType::Dexterity,
+            AttributeType::Constitution,
+            AttributeType::Luck,
+        ] {
+            assert_eq!(item.attributes.get(atr), &u32::MAX);
+        }
+
+        // Intelligence/Constitution/Luck, applied twice.
+        let item = parse_item([
+            (6, 3_000_000_000),
+            (23, 3_000_000_000),
+            (23, 3_000_000_000),
+        ]);
+        assert_eq!(
+            item.attributes.get(AttributeType::Strength),
+            &3_000_000_000
+        );
+        assert_eq!(
+            item.attributes.get(AttributeType::Dexterity),
+            &3_000_000_000
+        );
+        for atr in [
+            AttributeType::Intelligence,
+            AttributeType::Constitution,
+            AttributeType::Luck,
+        ] {
+            assert_eq!(item.attributes.get(atr), &u32::MAX);
+        }
+    }
 }
